@@ -1,0 +1,52 @@
+export const NORTH_SHORE_SUBURBS = [
+  "Northcross",
+  "Oteha",
+  "Torbay",
+  "Fairview Heights",
+  "Waiake",
+  "Browns Bay",
+  "Long Bay",
+  "Pinehill",
+  "Rothesay Bay",
+  "Murrays Bay",
+  "Albany",
+  "Rosedale",
+  "Mairangi Bay",
+  "Campbells Bay",
+  "Sunnynook",
+  "Unsworth Heights",
+  "Schnapper Rock",
+  "Greenhithe",
+  "Totara Vale",
+  "Castor Bay",
+  "Forrest Hill",
+  "Bayview",
+  "Wairau Valley",
+  "Glenfield",
+  "Milford",
+  "Hillcrest",
+  "Birkdale",
+  "Beach Haven",
+  "Takapuna",
+  "Northcote",
+  "Birkenhead",
+  "Hauraki",
+  "Chatswood",
+  "Northcote Point",
+  "Belmont",
+  "Bayswater",
+  "Narrow Neck",
+  "Devonport",
+  "Stanley Point",
+  "Okura",
+  "Paremoremo",
+  "Windsor Park",
+] as const;
+
+export type NorthShoreSuburb = (typeof NORTH_SHORE_SUBURBS)[number];
+
+export function isNorthShoreSuburb(value: string): value is NorthShoreSuburb {
+  return NORTH_SHORE_SUBURBS.some(
+    (suburb) => suburb.toLowerCase() === value.trim().toLowerCase(),
+  );
+}

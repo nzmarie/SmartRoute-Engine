@@ -1,0 +1,10 @@
+/Doc/SmartRoute-Engine-*.md
+node_modules/
+.next/
+out/
+coverage/
+.playwright-mcp/
+.env*
+!.env.example
+*.tsbuildinfo
+next-env.d.ts
