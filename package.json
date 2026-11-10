@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "eslint src tests",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-test-coverage --test-coverage-lines=80 --test-coverage-functions=80 --test-coverage-branches=80 --test-coverage-include=src/lib/address-status.ts --test-coverage-include=src/lib/admin-access.ts --test-coverage-include=src/lib/map-address-results.ts --test-coverage-include=src/lib/outreach-period.ts --test-coverage-include=src/lib/north-shore-suburbs.ts --import tsx --test \"tests/*.test.ts\""
+    "test": "node --experimental-test-coverage --test-coverage-lines=80 --test-coverage-functions=80 --test-coverage-branches=80 --test-coverage-include=src/lib/address-status.ts --test-coverage-include=src/lib/admin-access.ts --test-coverage-include=src/lib/map-address-results.ts --test-coverage-include=src/lib/outreach-period.ts --test-coverage-include=src/lib/north-shore-suburbs.ts --test-coverage-include=src/lib/delivery-simulation.ts --import tsx --test \"tests/*.test.ts\""
   },
   "type": "module",
   "dependencies": {

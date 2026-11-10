@@ -474,14 +474,22 @@ a {
 
 .map-canvas {
   position: relative;
-  height: min(68vh, 760px);
-  min-height: 430px;
+  height: min(82vh, 900px);
+  min-height: 650px;
   background: #e9f1f8;
 }
 
-.google-map {
+.google-map-content {
+  display: flex;
   width: 100%;
   height: 100%;
+  flex-direction: column;
+}
+
+.google-map {
+  min-height: 350px;
+  width: 100%;
+  flex: 1;
 }
 
 .advanced-address-marker {
@@ -516,6 +524,25 @@ a {
   background: #eab308;
 }
 
+.advanced-address-marker.planned:not(.pulsing) span {
+  outline: 2px solid #16a34a;
+  outline-offset: 2px;
+}
+
+.advanced-address-marker.pulsing span {
+  animation: address-pulse 850ms ease-in-out infinite alternate;
+  box-shadow: 0 0 0 6px rgba(220, 38, 38, 0.2), 0 1px 3px rgba(15, 23, 42, 0.45);
+}
+
+@keyframes address-pulse {
+  from {
+    transform: scale(1);
+  }
+  to {
+    transform: scale(1.55);
+  }
+}
+
 .advanced-address-marker:focus-visible {
   outline: 2px solid #1d4ed8;
   outline-offset: 2px;
@@ -548,6 +575,271 @@ a {
   align-self: flex-start;
   margin-top: 3px;
   text-decoration: none;
+}
+
+.simulation-panel {
+  display: grid;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+  gap: 12px;
+}
+
+.simulation-heading,
+.simulation-form,
+.simulation-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.simulation-heading {
+  justify-content: space-between;
+}
+
+.simulation-heading h2 {
+  margin: 0;
+  color: #23344e;
+  font-size: 15px;
+}
+
+.simulation-heading p,
+.simulation-disclaimer {
+  margin: 4px 0 0;
+  color: #728198;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.simulation-badge {
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: #fff7ed;
+  color: #9a4f18;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.simulation-form {
+  align-items: flex-end;
+}
+
+.simulation-start-control,
+.simulation-speed-control {
+  display: grid;
+  color: #526179;
+  font-size: 11px;
+  font-weight: 700;
+  gap: 5px;
+}
+
+.simulation-start-control {
+  min-width: 260px;
+  flex: 1;
+}
+
+.simulation-start-control input,
+.simulation-speed-control select,
+.simulation-speed-control input {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid #d5deea;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #26364f;
+  font: inherit;
+}
+
+.simulation-speed-control select,
+.simulation-speed-control input {
+  min-width: 76px;
+}
+
+.simulation-button {
+  min-height: 38px;
+  padding: 8px 13px;
+  border: 1px solid #255bb4;
+  border-radius: 8px;
+  background: #255bb4;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.simulation-button.secondary {
+  border-color: #d5deea;
+  background: #ffffff;
+  color: #40516a;
+}
+
+.simulation-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.simulation-status {
+  min-height: 18px;
+  color: #697991;
+  font-size: 12px;
+}
+
+.simulation-status strong {
+  color: #33445f;
+}
+
+.simulation-progress-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8edf4;
+}
+
+.simulation-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2563eb, #16a34a);
+  transition: width 120ms linear;
+}
+
+.simulation-disclaimer {
+  margin: 0;
+  font-size: 11px;
+}
+
+.simulation-error {
+  margin: 0;
+  color: #a34429;
+  font-size: 12px;
+}
+
+.simulation-count-note {
+  color: #9a4f18;
+  font-weight: 700;
+}
+
+.simulation-parking-marker,
+.simulation-moving-marker {
+  display: grid;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  place-items: center;
+}
+
+.simulation-parking-marker {
+  width: 27px;
+  height: 27px;
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+  background: #334155;
+  box-shadow: 0 1px 5px rgba(15, 23, 42, 0.5);
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.simulation-moving-marker {
+  width: 40px;
+  height: 40px;
+  filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.45));
+  line-height: 1;
+}
+
+.simulation-orientation {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+}
+
+.simulation-car-icon,
+.simulation-walker-icon {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.car-tire {
+  fill: #1e293b;
+}
+
+.car-body {
+  fill: #2563eb;
+  stroke: #ffffff;
+  stroke-width: 1.5;
+}
+
+.car-glass {
+  fill: #bfdbfe;
+  stroke: #1d4ed8;
+  stroke-width: 1;
+}
+
+.car-light {
+  fill: #fef08a;
+}
+
+.car-detail {
+  fill: none;
+  stroke: #dbeafe;
+  stroke-linecap: round;
+  stroke-width: 1.5;
+}
+
+.simulation-moving-marker.walker {
+  width: 34px;
+  height: 42px;
+}
+
+.walker-head {
+  fill: #f1c7a5;
+  stroke: #334155;
+  stroke-width: 2;
+}
+
+.walker-limb {
+  fill: none;
+  stroke: #334155;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 4;
+}
+
+.simulation-moving-marker.walking .walker-leg-a {
+  animation: walker-step 450ms ease-in-out infinite alternate;
+  transform-box: view-box;
+  transform-origin: 50% 58.333%;
+}
+
+.simulation-moving-marker.walking .walker-leg-b {
+  animation: walker-step 450ms ease-in-out -450ms infinite alternate;
+  transform-box: view-box;
+  transform-origin: 50% 58.333%;
+}
+
+.simulation-moving-marker.walking .simulation-walker-icon {
+  animation: walker-bob 450ms ease-in-out infinite alternate;
+}
+
+@keyframes walker-step {
+  from {
+    transform: rotate(-24deg);
+  }
+  to {
+    transform: rotate(24deg);
+  }
+}
+
+@keyframes walker-bob {
+  from {
+    translate: 0 1px;
+  }
+  to {
+    translate: 0 -1px;
+  }
 }
 
 .map-footer {
@@ -818,6 +1110,23 @@ a {
   .map-footer {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .simulation-panel {
+    padding: 14px;
+  }
+
+  .simulation-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .simulation-start-control {
+    min-width: 100%;
+  }
+
+  .simulation-speed-control {
+    flex: 1;
   }
 
   .map-summary-counts {

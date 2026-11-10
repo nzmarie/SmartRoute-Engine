@@ -6,6 +6,8 @@ function row(overrides: Partial<MapAddressRow> = {}): MapAddressRow {
   return {
     address_key: "address-1",
     address: "1 Example Street, Albany",
+    street: "Example Street",
+    house_number: 1,
     latitude: -36.731,
     longitude: 174.705,
     is_junk: false,
@@ -22,9 +24,33 @@ test("maps valid points and counts each derived status", () => {
   ]);
 
   assert.deepEqual(result.points, [
-    { address: "1 Example Street, Albany", lat: -36.731, lng: 174.705, status: "unsent" },
-    { address: "1 Example Street, Albany", lat: -36.731, lng: 174.705, status: "sent" },
-    { address: "1 Example Street, Albany", lat: -36.731, lng: 174.705, status: "junk" },
+    {
+      addressKey: "address-1",
+      address: "1 Example Street, Albany",
+      street: "Example Street",
+      houseNumber: 1,
+      lat: -36.731,
+      lng: 174.705,
+      status: "unsent",
+    },
+    {
+      addressKey: "address-2",
+      address: "1 Example Street, Albany",
+      street: "Example Street",
+      houseNumber: 1,
+      lat: -36.731,
+      lng: 174.705,
+      status: "sent",
+    },
+    {
+      addressKey: "address-3",
+      address: "1 Example Street, Albany",
+      street: "Example Street",
+      houseNumber: 1,
+      lat: -36.731,
+      lng: 174.705,
+      status: "junk",
+    },
   ]);
   assert.deepEqual(result.summary, {
     total: 3,
@@ -32,6 +58,25 @@ test("maps valid points and counts each derived status", () => {
     missingCoordinates: 0,
     states: { unsent: 1, sent: 1, junk: 1 },
   });
+});
+
+test("keeps street data and safely parses house numbers", () => {
+  const result = processMapAddressRows([
+    row({ street: "The Avenue", house_number: "5" }),
+    row({ address_key: "address-2", house_number: "not-a-number" }),
+    row({ address_key: "address-3", street: null, house_number: null }),
+    row({ address_key: "address-4", house_number: "" }),
+  ]);
+
+  assert.deepEqual(
+    result.points.map(({ street, houseNumber }) => ({ street, houseNumber })),
+    [
+      { street: "The Avenue", houseNumber: 5 },
+      { street: "Example Street", houseNumber: null },
+      { street: null, houseNumber: null },
+      { street: "Example Street", houseNumber: null },
+    ],
+  );
 });
 
 test("counts an address status even when its coordinates are missing", () => {

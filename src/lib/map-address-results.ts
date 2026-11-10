@@ -3,6 +3,8 @@ import { resolveAddressStatus, type AddressStatus } from "./address-status";
 export interface MapAddressRow {
   address_key: string;
   address: string;
+  street: string | null;
+  house_number: number | string | null;
   latitude: number | null;
   longitude: number | null;
   is_junk: boolean;
@@ -10,7 +12,10 @@ export interface MapAddressRow {
 }
 
 export interface MapAddressPoint {
+  addressKey: string;
   address: string;
+  street: string | null;
+  houseNumber: number | null;
   lat: number;
   lng: number;
   status: AddressStatus;
@@ -51,7 +56,20 @@ export function processMapAddressRows(rows: MapAddressRow[]) {
       continue;
     }
 
-    points.push({ address: row.address, lat, lng, status });
+    const parsedHouseNumber =
+      row.house_number === null || String(row.house_number).trim() === ""
+        ? Number.NaN
+        : Number(row.house_number);
+    const houseNumber = Number.isSafeInteger(parsedHouseNumber) ? parsedHouseNumber : null;
+    points.push({
+      addressKey: row.address_key,
+      address: row.address,
+      street: row.street,
+      houseNumber,
+      lat,
+      lng,
+      status,
+    });
   }
 
   return {

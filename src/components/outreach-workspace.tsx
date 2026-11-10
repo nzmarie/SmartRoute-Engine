@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ADDRESS_STATUS_COLORS,
   ADDRESS_STATUS_LABELS,
@@ -40,6 +40,9 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
   const [mapData, setMapData] = useState<MapData | null>(null);
   const [mapLoading, setMapLoading] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
+  const [simulatedDeliveryAddressKeys, setSimulatedDeliveryAddressKeys] = useState<string[] | null>(
+    null,
+  );
   const quarterController = useRef<AbortController | null>(null);
   const apiKey =
     process.env.NEXT_PUBLIC_SMARTROUTE_GOOGLE_MAPS_API_KEY ??
@@ -50,10 +53,15 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
   const selectedYear = selectedPeriod?.year ?? null;
   const selectedQuarter = selectedPeriod?.quarter ?? null;
 
+  const handleSimulatedDeliveryChange = useCallback((addressKeys: string[] | null) => {
+    setSimulatedDeliveryAddressKeys(addressKeys);
+  }, []);
+
   async function chooseSuburb(suburb: string) {
     setSelectedSuburb(suburb);
     setViewMode("map");
     setMapData(null);
+    setSimulatedDeliveryAddressKeys(null);
     setMapError(null);
     setPeriods([]);
     setSelectedPeriodKey("2026:Q3");
@@ -146,9 +154,14 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
   const visiblePoints = useMemo(
     () =>
       (mapData?.points ?? []).filter(
-        (point) => statusFilter === "all" || point.status === statusFilter,
+        (point) => {
+          const simulatedSent =
+            point.status === "unsent" && simulatedDeliveryAddressKeys?.includes(point.addressKey);
+          const effectiveStatus = simulatedSent ? "sent" : point.status;
+          return statusFilter === "all" || effectiveStatus === statusFilter;
+        },
       ),
-    [mapData?.points, statusFilter],
+    [mapData?.points, simulatedDeliveryAddressKeys, statusFilter],
   );
 
   return (
@@ -196,6 +209,7 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
               onChange={(event) => {
                 setSelectedPeriodKey(event.target.value);
                 setMapData(null);
+                setSimulatedDeliveryAddressKeys(null);
               }}
             >
               <option value="all">All history</option>
@@ -238,7 +252,16 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
                 const count =
                   status === "all"
                     ? mapData?.summary.total
-                    : mapData?.summary.states[status];
+                    : status === "unsent"
+                      ? Math.max(
+                          0,
+                          (mapData?.summary.states.unsent ?? 0) -
+                            (simulatedDeliveryAddressKeys?.length ?? 0),
+                        )
+                      : status === "sent"
+                        ? (mapData?.summary.states.sent ?? 0) +
+                          (simulatedDeliveryAddressKeys?.length ?? 0)
+                        : mapData?.summary.states[status];
                 return (
                   <button
                     key={status}
@@ -266,6 +289,14 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
                   <span>{mapData.summary.mapped.toLocaleString()} mapped</span>
                   <span className="summary-separator">·</span>
                   <span>{mapData.summary.missingCoordinates.toLocaleString()} without coordinates</span>
+                  {simulatedDeliveryAddressKeys ? (
+                    <>
+                      <span className="summary-separator">·</span>
+                      <span className="simulation-count-note">
+                        {simulatedDeliveryAddressKeys.length} simulation-only sent
+                      </span>
+                    </>
+                  ) : null}
                 </>
               ) : null}
             </div>
@@ -291,7 +322,13 @@ export function OutreachWorkspace({ suburbs }: OutreachWorkspaceProps) {
           ) : mapData ? (
             <>
               <div className="map-canvas">
-                <GoogleOutreachMap apiKey={apiKey} points={visiblePoints} />
+                <GoogleOutreachMap
+                  apiKey={apiKey}
+                  points={visiblePoints}
+                  simulationPoints={mapData.points}
+                  simulatedDeliveryAddressKeys={simulatedDeliveryAddressKeys ?? []}
+                  onSimulatedDeliveryChange={handleSimulatedDeliveryChange}
+                />
               </div>
               <div className="map-footer">
                 <div className="map-legend" aria-label="Address status legend">

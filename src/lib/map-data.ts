@@ -52,6 +52,8 @@ const MAP_ROWS_CTE = `
         LOWER(TRIM(op.property_address))
       ) AS address_key,
       op.property_address AS address,
+      op.street,
+      op.house_number,
       COALESCE(p.latitude, fallback.latitude) AS latitude,
       COALESCE(p.longitude, fallback.longitude) AS longitude,
       (
@@ -87,16 +89,6 @@ const MAP_ROWS_CTE = `
               AND r.year = $2::BIGINT
               AND r.quarter = $3::TEXT
           )
-          AND (
-            qs.outreach_property_id IS NOT NULL
-            OR NOT EXISTS (
-              SELECT 1
-              FROM outreach_property_quarter_status q
-              WHERE LOWER(q.suburb) = LOWER($1)
-                AND q.year = $2::BIGINT
-                AND q.quarter = $3::TEXT
-            )
-          )
         )
       )
   ),
@@ -104,6 +96,8 @@ const MAP_ROWS_CTE = `
     SELECT
       address_key,
       MAX(address) AS address,
+      MAX(street) AS street,
+      MAX(house_number) AS house_number,
       MAX(latitude) FILTER (WHERE latitude IS NOT NULL AND longitude IS NOT NULL) AS latitude,
       MAX(longitude) FILTER (WHERE latitude IS NOT NULL AND longitude IS NOT NULL) AS longitude,
       BOOL_OR(is_junk) AS is_junk,
@@ -129,7 +123,7 @@ export async function loadMapAddresses(
   const parameters = [suburb, year, quarter];
   const result = await client.query<MapAddressRow>(
     `${MAP_ROWS_CTE}
-      SELECT address_key, address, latitude, longitude, is_junk, has_sent
+      SELECT address_key, address, street, house_number, latitude, longitude, is_junk, has_sent
       FROM deduplicated
       ORDER BY address_key
       LIMIT $4`,

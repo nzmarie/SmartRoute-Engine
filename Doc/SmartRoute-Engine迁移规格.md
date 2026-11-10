@@ -161,6 +161,8 @@ SmartRoute-Engine 是基于已有真实直邮地址、地理坐标和发送历�
 
 `outreach_property_quarter_status` 在 `migrations/001_quarter_aware_outreach_status.sql` 中定义：地址/报告组合唯一；包含 `suburb`、`quarter`、`year`、生成的 `quarter_key`、`status(pending|sent|partial)`、`sent_count`、首末发送时间和 `campaign_keys`。`database/migrations/057_add_quarter_dispatch_junk.sql` 另加 `is_junk`、`junk_at`。Junk 可能按全局属性或报告季度维护，迁移时必须保留来源层级，不能把季度勿投误写成全局勿投。
 
+季度地图以有效的 `suburb_reports` 报告作为周期门槛，地址集合仍来自该 Suburb 的全部 `outreach_properties`；季度状态和发送日志只覆盖/补充对应地址的状态。不能因某季度已有部分地址状态行，就过滤掉没有状态行的地址；这些地址应按 Unsent（除非该季度发送日志或全局 Junk 标记另有说明）呈现。
+
 ### 5.3 坐标与街道地点
 
 - 地图 API 从 `properties.latitude/longitude` 取地址坐标，优先关联 `outreach_properties.property_id` 与 `properties.id`；另有按地址+Suburb 的 fallback。
