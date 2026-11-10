@@ -474,8 +474,8 @@ a {
 
 .map-canvas {
   position: relative;
-  height: min(82vh, 900px);
-  min-height: 650px;
+  height: min(106.6vh, 1170px);
+  min-height: 845px;
   background: #e9f1f8;
 }
 
@@ -579,10 +579,10 @@ a {
 
 .simulation-panel {
   display: grid;
-  padding: 18px 20px 14px;
+  padding: 10px 16px 8px;
   border-bottom: 1px solid var(--line);
   background: #ffffff;
-  gap: 12px;
+  gap: 8px;
 }
 
 .simulation-heading,
@@ -612,6 +612,10 @@ a {
   line-height: 1.5;
 }
 
+.simulation-heading p {
+  max-width: 760px;
+}
+
 .simulation-badge {
   padding: 6px 9px;
   border-radius: 999px;
@@ -626,7 +630,8 @@ a {
 }
 
 .simulation-start-control,
-.simulation-speed-control {
+.simulation-speed-control,
+.simulation-checkbox-control {
   display: grid;
   color: #526179;
   font-size: 11px;
@@ -635,8 +640,9 @@ a {
 }
 
 .simulation-start-control {
+  width: min(40vw, 420px);
   min-width: 260px;
-  flex: 1;
+  flex: 0 1 420px;
 }
 
 .simulation-start-control input,
@@ -654,6 +660,61 @@ a {
 .simulation-speed-control select,
 .simulation-speed-control input {
   min-width: 76px;
+}
+
+.simulation-checkbox-control {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.simulation-checkbox-control input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #2563eb;
+}
+
+.route-visibility-control input {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  flex: 0 0 auto;
+  appearance: none;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #e2e8f0;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.route-visibility-control input::before {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.25);
+  content: "";
+  transition: transform 140ms ease;
+}
+
+.route-visibility-control input:checked {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
+.route-visibility-control input:checked::before {
+  transform: translateX(14px);
+}
+
+.route-visibility-control input:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.25);
+  outline-offset: 2px;
 }
 
 .simulation-button {
@@ -687,6 +748,45 @@ a {
 
 .simulation-status strong {
   color: #33445f;
+}
+
+.simulation-live-strip {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  color: #526179;
+  font-size: 12px;
+}
+
+.simulation-live-strip strong {
+  color: #33445f;
+  font-weight: 700;
+}
+
+.simulation-details {
+  padding: 0 16px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.simulation-details summary {
+  width: fit-content;
+  color: #526179;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.simulation-details-content {
+  display: grid;
+  padding-top: 10px;
+  gap: 8px;
+}
+
+.simulation-details-content .simulation-status {
+  align-items: flex-start;
 }
 
 .simulation-progress-track {
@@ -1113,7 +1213,7 @@ a {
   }
 
   .simulation-panel {
-    padding: 14px;
+    padding: 10px 12px 8px;
   }
 
   .simulation-heading {
@@ -1123,10 +1223,17 @@ a {
 
   .simulation-start-control {
     min-width: 100%;
+    width: 100%;
+    flex-basis: 100%;
   }
 
   .simulation-speed-control {
     flex: 1;
+  }
+
+  .simulation-details {
+    padding-right: 12px;
+    padding-left: 12px;
   }
 
   .map-summary-counts {
@@ -1134,7 +1241,7 @@ a {
   }
 
   .map-canvas {
-    min-height: 380px;
+    min-height: 494px;
   }
 
   .map-legend {

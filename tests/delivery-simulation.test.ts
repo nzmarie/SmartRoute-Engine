@@ -2,19 +2,31 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { MapAddressPoint } from "../src/lib/map-address-results.ts";
 import {
+  advanceSimulationTime,
   buildDeliverySimulationPlan,
   buildStreetDeliveryPlan,
+  chooseNearbyDeliveryCandidate,
+  getNearbyDeliveryCandidates,
+  getSimulationPlanningPoints,
+  combineSimulationCyclePlans,
   getPathHeading,
   getSimulationDuration,
   getSimulationFrame,
   getWalkReturnRequests,
   getWalkingRouteChunks,
+  insertNearbyDeliveryIntoPlan,
   interpolateLocation,
   interpolatePath,
   isNorthShoreGeocodeResult,
   MAX_SIMULATION_DELIVERIES,
+  MAX_NEARBY_DELIVERY_CANDIDATES,
+  MAX_NEARBY_DELIVERY_DETOUR_MS,
+  MAX_SIMULATION_CYCLES,
+  NEARBY_DELIVERY_RADIUS_METERS,
   MAX_WALK_DURATION_MS,
   orderStreetsByRouteTime,
+  selectSimulationCycleBatches,
+  SIMULATION_CYCLE_DELAY_MS,
   type SimulationLocation,
   type SimulationRouteLeg,
 } from "../src/lib/delivery-simulation.ts";
@@ -119,6 +131,273 @@ test("accepts known North Shore geocoding components only", () => {
   assert.equal(isNorthShoreGeocodeResult(["5 The Avenue", "Albany", "Auckland"]), true);
   assert.equal(isNorthShoreGeocodeResult(["5 Example Road", "Wellington"]), false);
   assert.equal(isNorthShoreGeocodeResult([]), false);
+});
+
+test("finds only the nearest unplanned Unsent addresses within the nearby radius", () => {
+  const points = [
+    ...Array.from({ length: MAX_NEARBY_DELIVERY_CANDIDATES + 2 }, (_, index) =>
+      point(`Nearby ${index}`, index * 0.0001, 0, "unsent", `near-${index}`),
+    ),
+    point("Already sent", 0.00001, 0, "sent", "sent"),
+    point("Too far", NEARBY_DELIVERY_RADIUS_METERS / 100_000, 0, "unsent", "far"),
+  ];
+  const candidates = getNearbyDeliveryCandidates(
+    { lat: 0, lng: 0 },
+    points,
+    new Set(["near-0"]),
+  );
+
+  assert.equal(candidates.length, MAX_NEARBY_DELIVERY_CANDIDATES);
+  assert.equal(candidates[0]?.addressKey, "near-1");
+  assert.equal(candidates.some(({ addressKey }) => addressKey === "sent"), false);
+  assert.equal(candidates.some(({ addressKey }) => addressKey === "far"), false);
+});
+
+test("chooses a reachable nearby address only when its detour stays within budget", () => {
+  const candidates = [
+    point("Good detour", 0.0001, 0, "unsent", "good"),
+    point("Long detour", 0.0002, 0, "unsent", "long"),
+    point("Long individual leg", 0.0003, 0, "unsent", "leg"),
+  ];
+  const baseline = 5 * 60_000;
+  const selected = chooseNearbyDeliveryCandidate(
+    candidates,
+    [2 * 60_000, 5 * 60_000, MAX_WALK_DURATION_MS + 1],
+    [2 * 60_000, 5 * 60_000, 1_000],
+    baseline,
+  );
+
+  assert.equal(selected?.point.addressKey, "good");
+  assert.equal(selected?.fromOriginDurationMs + selected?.toNextDurationMs, 4 * 60_000);
+  assert.equal(
+    chooseNearbyDeliveryCandidate(candidates.slice(1, 2), [5 * 60_000], [5 * 60_000], baseline),
+    null,
+  );
+  assert.equal(
+    chooseNearbyDeliveryCandidate(
+      candidates.slice(0, 1),
+      [baseline + MAX_NEARBY_DELIVERY_DETOUR_MS + 1],
+      [0],
+      baseline,
+    ),
+    null,
+  );
+});
+
+test("inserts a nearby delivery into the remaining route without changing completed deliveries", () => {
+  const { plan } = makeRoutedPlan();
+  const completedDeliveryCount = 1;
+  const next = plan.deliveries[completedDeliveryCount]!;
+  const existingWalk = plan.steps.find(
+    ({ kind, addressKey }) => kind === "walk" && addressKey === next.addressKey,
+  )!;
+  const candidate = point(
+    "Nearby address",
+    (existingWalk.from.lat + existingWalk.to.lat) / 2,
+    (existingWalk.from.lng + existingWalk.to.lng) / 2,
+    "unsent",
+    "nearby",
+  );
+  const updatedPlan = insertNearbyDeliveryIntoPlan(
+    plan,
+    completedDeliveryCount,
+    plan.steps.indexOf(existingWalk),
+    candidate,
+    existingWalk.from,
+    routeLeg(existingWalk.from, candidate, 60_000, 80),
+    routeLeg(candidate, existingWalk.to, 60_000, 90),
+  );
+
+  assert.deepEqual(
+    updatedPlan.deliveries.map(({ addressKey }) => addressKey),
+    [
+      ...plan.deliveries.slice(0, completedDeliveryCount).map(({ addressKey }) => addressKey),
+      "nearby",
+      ...plan.deliveries.slice(completedDeliveryCount).map(({ addressKey }) => addressKey),
+    ],
+  );
+  assert.deepEqual(
+    updatedPlan.steps.filter(({ kind }) => kind === "deliver").map(({ addressKey }) => addressKey),
+    updatedPlan.deliveries.map(({ addressKey }) => addressKey),
+  );
+  assert.equal(updatedPlan.steps.filter(({ addressKey }) => addressKey === "nearby").length, 2);
+  assert.equal(
+    updatedPlan.totalDistanceMeters,
+    plan.totalDistanceMeters - existingWalk.distanceMeters + 170,
+  );
+  assert.equal(
+    getSimulationFrame(
+      updatedPlan.steps,
+      getSimulationDuration(updatedPlan.steps),
+    ).deliveredAddresses.includes("nearby"),
+    true,
+  );
+});
+
+test("can add one nearby address before walking back to the marked parking point", () => {
+  const start = { lat: 0, lng: 0 };
+  const basePlan = buildStreetDeliveryPlan(
+    start,
+    [
+      { ...point("A", 0.001, 0), street: "Example Road" },
+      { ...point("B", 0.002, 0), street: "Example Road" },
+    ],
+    2,
+  );
+  const [first, second] = basePlan.deliveries;
+  const walkingLeg = routeLeg(first!, second!);
+  const plan = buildDeliverySimulationPlan(
+    basePlan,
+    routeLeg(start, first!),
+    [walkingLeg],
+    new Map(),
+    makeWalkReturnLegs(basePlan.deliveries, [walkingLeg]),
+    routeLeg(first!, start),
+  );
+  const returnStepIndex = plan.steps.findIndex(({ kind }) => kind === "walk-return");
+  const returnStep = plan.steps[returnStepIndex]!;
+  const candidate = point("Near parking return", 0.0015, 0.0001, "unsent", "near-return");
+  const updatedPlan = insertNearbyDeliveryIntoPlan(
+    plan,
+    plan.deliveries.length,
+    returnStepIndex,
+    candidate,
+    returnStep.from,
+    routeLeg(returnStep.from, candidate, 60_000, 80),
+    routeLeg(candidate, returnStep.to, 60_000, 90),
+  );
+
+  assert.equal(updatedPlan.deliveries.at(-1)?.addressKey, "near-return");
+  assert.equal(updatedPlan.steps.filter(({ kind }) => kind === "walk-return").length, 1);
+  assert.deepEqual(
+    updatedPlan.steps
+      .filter(({ kind }) => kind === "deliver")
+      .map(({ addressKey }) => addressKey),
+    updatedPlan.deliveries.map(({ addressKey }) => addressKey),
+  );
+});
+
+test("selects repeated delivery batches without duplicating addresses from earlier runs", () => {
+  const points = Array.from({ length: 5 }, (_, index) => ({
+      ...point(`Address ${index}`, 0.02 + index * 0.02, 0, "unsent", `address-${index}`),
+      street: `Road ${index}`,
+    }));
+  const batches = selectSimulationCycleBatches(
+    { lat: 0, lng: 0 },
+    points,
+    2,
+    3,
+  );
+
+  assert.deepEqual(
+    batches.map((batch) => batch.map(({ addressKey }) => addressKey)),
+    [
+      ["address-0", "address-1"],
+      ["address-2", "address-3"],
+      ["address-4"],
+    ],
+  );
+  assert.deepEqual(
+    selectSimulationCycleBatches({ lat: 0, lng: 0 }, points, 2, 2, new Set(["address-0"]))
+      .flat()
+      .map(({ addressKey }) => addressKey),
+    ["address-1", "address-2", "address-3", "address-4"],
+  );
+  assert.throws(
+    () => selectSimulationCycleBatches({ lat: 0, lng: 0 }, points, 2, MAX_SIMULATION_CYCLES + 1),
+    /Choose between 1 and/,
+  );
+});
+
+test("includes Junk mail as an unsent simulation candidate only when its status is unknown", () => {
+  const points = [
+    point("Unsent", 0.001, 0, "unsent"),
+    point("Junk", 0.002, 0, "junk"),
+    point("Sent", 0.003, 0, "sent"),
+  ];
+
+  assert.deepEqual(
+    getSimulationPlanningPoints(points, false).map(({ status }) => status),
+    ["unsent", "junk", "sent"],
+  );
+  assert.deepEqual(
+    getSimulationPlanningPoints(points, true).map(({ status }) => status),
+    ["unsent", "unsent", "sent"],
+  );
+  assert.deepEqual(
+    selectSimulationCycleBatches(
+      { lat: 0, lng: 0 },
+      getSimulationPlanningPoints(points, true),
+      1,
+      1,
+    )
+      .flat()
+      .map(({ addressKey }) => addressKey),
+    ["Unsent", "Junk"],
+  );
+  assert.equal(points[1]?.status, "junk");
+});
+
+test("combines routed runs with a ten-second pause at the starting point", () => {
+  const first = makeRoutedPlan().plan;
+  const secondBase = buildStreetDeliveryPlan(
+    first.start,
+    [
+      point("Run two A", 0.005, 0, "unsent", "run-two-a"),
+      point("Run two B", 0.006, 0, "unsent", "run-two-b"),
+    ],
+    2,
+  );
+  const [firstSecondRun, secondSecondRun] = secondBase.deliveries;
+  const secondWalkingLeg = routeLeg(firstSecondRun!, secondSecondRun!);
+  const second = buildDeliverySimulationPlan(
+    secondBase,
+    routeLeg(secondBase.start, firstSecondRun!),
+    [secondWalkingLeg],
+    new Map(),
+    makeWalkReturnLegs(secondBase.deliveries, [secondWalkingLeg]),
+    routeLeg(firstSecondRun!, secondBase.start),
+  );
+  const combined = combineSimulationCyclePlans([first, second]);
+  const waitIndex = combined.steps.findIndex(({ kind }) => kind === "cycle-wait");
+  const waitStep = combined.steps[waitIndex]!;
+  const waitStart = combined.steps
+    .slice(0, waitIndex)
+    .reduce((elapsed, step) => elapsed + step.durationMs, 0);
+
+  assert.deepEqual(
+    combined.deliveries.map(({ addressKey }) => addressKey),
+    [
+      ...first.deliveries.map(({ addressKey }) => addressKey),
+      ...second.deliveries.map(({ addressKey }) => addressKey),
+    ],
+  );
+  assert.equal(waitStep.durationMs, SIMULATION_CYCLE_DELAY_MS);
+  assert.deepEqual(waitStep.from, first.start);
+  assert.deepEqual(waitStep.to, first.start);
+  assert.equal(waitStep.distanceMeters, 0);
+  assert.equal(combined.steps[waitIndex - 1]?.kind, "drive-return");
+  assert.equal(combined.steps[waitIndex + 1]?.kind, "drive");
+  assert.equal(combined.totalDistanceMeters, first.totalDistanceMeters + second.totalDistanceMeters);
+  assert.equal(getSimulationFrame(combined.steps, waitStart + 1).kind, "cycle-wait");
+  assert.deepEqual(getSimulationFrame(combined.steps, waitStart + waitStep.durationMs).position, first.start);
+  assert.equal(
+    advanceSimulationTime(combined.steps, waitStart - 100, 4_000, 50),
+    waitStart + 3_998,
+  );
+  assert.equal(
+    advanceSimulationTime(combined.steps, waitStart + 5_000, 5_000, 50),
+    waitStart + waitStep.durationMs,
+  );
+  assert.equal(
+    advanceSimulationTime(
+      combined.steps,
+      waitStart + waitStep.durationMs,
+      100,
+      50,
+    ),
+    waitStart + waitStep.durationMs + 5_000,
+  );
 });
 
 test("selects complete nearest street groups until the target is reached", () => {

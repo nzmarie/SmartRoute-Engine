@@ -6,6 +6,16 @@ export function resolveAddressStatus(isJunk: boolean, hasSent: boolean): Address
   return "unsent";
 }
 
+export function resolveSimulationDisplayStatus(
+  status: AddressStatus,
+  isDelivered: boolean,
+  junkStatusUnknown: boolean,
+): AddressStatus {
+  if (status === "junk" && junkStatusUnknown) return isDelivered ? "junk" : "unsent";
+  if (status === "unsent" && isDelivered) return "sent";
+  return status;
+}
+
 export const ADDRESS_STATUS_LABELS: Record<AddressStatus, string> = {
   unsent: "Unsent",
   sent: "Sent",

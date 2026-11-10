@@ -6,6 +6,12 @@ export interface SimulationLocation {
   lng: number;
 }
 
+export interface NearbyDeliveryCandidate {
+  point: MapAddressPoint;
+  fromOriginDurationMs: number;
+  toNextDurationMs: number;
+}
+
 export type SimulationStepKind =
   | "drive"
   | "park"
@@ -13,6 +19,7 @@ export type SimulationStepKind =
   | "walk"
   | "deliver"
   | "walk-return"
+  | "cycle-wait"
   | "drive-return";
 
 export interface SimulationRouteLeg {
@@ -35,6 +42,7 @@ export interface SimulationStep {
   to: SimulationLocation;
   path: SimulationLocation[];
   durationMs: number;
+  distanceMeters: number;
   parkingLocation: SimulationLocation;
   addressKey?: string;
   address?: string;
@@ -76,7 +84,13 @@ export interface SimulationFrame {
 }
 
 export const MAX_SIMULATION_DELIVERIES = 50;
+export const MAX_SIMULATION_CYCLES = 10;
+export const SIMULATION_CYCLE_DELAY_MS = 10_000;
 export const MAX_WALK_DURATION_MS = 10 * 60 * 1_000;
+export const MAX_NEARBY_DELIVERY_ADDITIONS = 5;
+export const MAX_NEARBY_DELIVERY_CANDIDATES = 8;
+export const NEARBY_DELIVERY_RADIUS_METERS = 250;
+export const MAX_NEARBY_DELIVERY_DETOUR_MS = 3 * 60 * 1_000;
 
 const MAX_ROUTE_INTERMEDIATES = 25;
 const MAX_ROUTE_EDGES = MAX_ROUTE_INTERMEDIATES + 1;
@@ -85,6 +99,16 @@ const INITIAL_STOP_NEIGHBORHOOD_RADIUS_METERS =
 const PARKING_DURATION_MS = 1_500;
 const BOARDING_DURATION_MS = 1_000;
 const DELIVERY_DURATION_MS = 15_000;
+
+export function getSimulationPlanningPoints(
+  points: MapAddressPoint[],
+  junkStatusUnknown: boolean,
+): MapAddressPoint[] {
+  if (!junkStatusUnknown) return points;
+  return points.map((point) =>
+    point.status === "junk" ? { ...point, status: "unsent" } : point,
+  );
+}
 
 export function isNorthShoreGeocodeResult(addressParts: string[]): boolean {
   const normalizedParts = addressParts.map(normalizeAddressPart);
@@ -126,6 +150,82 @@ export function buildStreetDeliveryPlan(
     returnDrivePath: [],
     totalDistanceMeters: 0,
     steps: [],
+  };
+}
+
+export function selectSimulationCycleBatches(
+  start: SimulationLocation,
+  points: MapAddressPoint[],
+  deliveriesPerCycle: number,
+  cycleCount: number,
+  excludedAddressKeys: ReadonlySet<string> = new Set(),
+): MapAddressPoint[][] {
+  if (
+    !Number.isInteger(deliveriesPerCycle) ||
+    deliveriesPerCycle < 1 ||
+    deliveriesPerCycle > MAX_SIMULATION_DELIVERIES
+  ) {
+    throw new Error(`Choose between 1 and ${MAX_SIMULATION_DELIVERIES} addresses per run.`);
+  }
+  if (
+    !Number.isInteger(cycleCount) ||
+    cycleCount < 1 ||
+    cycleCount > MAX_SIMULATION_CYCLES
+  ) {
+    throw new Error(`Choose between 1 and ${MAX_SIMULATION_CYCLES} runs.`);
+  }
+
+  const excluded = new Set(excludedAddressKeys);
+  const batches: MapAddressPoint[][] = [];
+  for (let cycle = 0; cycle < cycleCount; cycle += 1) {
+    const remaining = points.filter(
+      ({ addressKey, status }) => status === "unsent" && !excluded.has(addressKey),
+    );
+    if (!remaining.length) break;
+    const count = Math.min(deliveriesPerCycle, remaining.length);
+    const batch = buildStreetDeliveryPlan(start, points, count, excluded).deliveries;
+    if (!batch.length) break;
+    batches.push(batch);
+    for (const { addressKey } of batch) excluded.add(addressKey);
+  }
+  return batches;
+}
+
+export function combineSimulationCyclePlans(
+  plans: StreetDeliveryPlan[],
+  delayMs = SIMULATION_CYCLE_DELAY_MS,
+): StreetDeliveryPlan {
+  if (!plans.length || !Number.isFinite(delayMs) || delayMs < 0) {
+    throw new Error("At least one valid simulation cycle is required.");
+  }
+
+  const firstPlan = plans[0]!;
+  const steps = plans.flatMap((plan, index) =>
+    index === plans.length - 1
+      ? plan.steps
+      : [
+          ...plan.steps,
+          {
+            kind: "cycle-wait" as const,
+            from: plan.start,
+            to: plan.start,
+            path: [plan.start],
+            durationMs: delayMs,
+            distanceMeters: 0,
+            parkingLocation: plan.start,
+          },
+        ],
+  );
+  const lastPlan = plans.at(-1)!;
+  return {
+    ...firstPlan,
+    deliveries: plans.flatMap(({ deliveries }) => deliveries),
+    drivingStopAddressKeys: plans.flatMap(({ drivingStopAddressKeys }) => drivingStopAddressKeys),
+    drivingPaths: plans.flatMap(({ drivingPaths }) => drivingPaths),
+    walkingPaths: plans.flatMap(({ walkingPaths }) => walkingPaths),
+    returnDrivePath: lastPlan.returnDrivePath,
+    totalDistanceMeters: plans.reduce((total, plan) => total + plan.totalDistanceMeters, 0),
+    steps,
   };
 }
 
@@ -271,6 +371,158 @@ export function getWalkReturnRequests(
   }
 
   return requests;
+}
+
+export function getNearbyDeliveryCandidates(
+  origin: SimulationLocation,
+  points: MapAddressPoint[],
+  excludedAddressKeys: ReadonlySet<string>,
+): MapAddressPoint[] {
+  return points
+    .filter(
+      (point) =>
+        point.status === "unsent" &&
+        !excludedAddressKeys.has(point.addressKey) &&
+        distanceMeters(origin, point) <= NEARBY_DELIVERY_RADIUS_METERS,
+    )
+    .sort(
+      (left, right) =>
+        distanceMeters(origin, left) - distanceMeters(origin, right) ||
+        left.addressKey.localeCompare(right.addressKey),
+    )
+    .slice(0, MAX_NEARBY_DELIVERY_CANDIDATES);
+}
+
+export function chooseNearbyDeliveryCandidate(
+  candidates: MapAddressPoint[],
+  fromOriginDurations: Array<number | null>,
+  toNextDurations: Array<number | null>,
+  baselineDurationMs: number | null,
+): NearbyDeliveryCandidate | null {
+  if (
+    baselineDurationMs === null ||
+    baselineDurationMs < 0 ||
+    fromOriginDurations.length !== candidates.length ||
+    toNextDurations.length !== candidates.length
+  ) {
+    return null;
+  }
+
+  return candidates
+    .flatMap((point, index) => {
+      const fromOriginDurationMs = fromOriginDurations[index];
+      const toNextDurationMs = toNextDurations[index];
+      if (
+        fromOriginDurationMs === null ||
+        fromOriginDurationMs === undefined ||
+        toNextDurationMs === null ||
+        toNextDurationMs === undefined ||
+        !Number.isFinite(fromOriginDurationMs) ||
+        !Number.isFinite(toNextDurationMs) ||
+        fromOriginDurationMs < 0 ||
+        toNextDurationMs < 0 ||
+        fromOriginDurationMs > MAX_WALK_DURATION_MS ||
+        toNextDurationMs > MAX_WALK_DURATION_MS ||
+        fromOriginDurationMs + toNextDurationMs >
+          baselineDurationMs + MAX_NEARBY_DELIVERY_DETOUR_MS
+      ) {
+        return [];
+      }
+
+      return [{ point, fromOriginDurationMs, toNextDurationMs }];
+    })
+    .sort(
+      (left, right) =>
+        left.fromOriginDurationMs + left.toNextDurationMs -
+          right.fromOriginDurationMs - right.toNextDurationMs ||
+        left.point.addressKey.localeCompare(right.point.addressKey),
+    )[0] ?? null;
+}
+
+export function insertNearbyDeliveryIntoPlan(
+  plan: StreetDeliveryPlan,
+  completedDeliveryCount: number,
+  currentStepIndex: number,
+  point: MapAddressPoint,
+  origin: SimulationLocation,
+  fromOriginLeg: SimulationRouteLeg,
+  toNextLeg: SimulationRouteLeg,
+): StreetDeliveryPlan {
+  const nextDelivery = plan.deliveries[completedDeliveryCount];
+  if (
+    completedDeliveryCount > plan.deliveries.length ||
+    point.status !== "unsent" ||
+    plan.deliveries.some(({ addressKey }) => addressKey === point.addressKey)
+  ) {
+    throw new Error("The nearby address is no longer available for this simulation.");
+  }
+
+  const nextWalkStepIndex = currentStepIndex;
+  const existingWalkStep = plan.steps[nextWalkStepIndex];
+  if (
+    !existingWalkStep ||
+    nextWalkStepIndex < 0 ||
+    (existingWalkStep.kind !== "walk" && existingWalkStep.kind !== "walk-return")
+  ) {
+    throw new Error("The current walking segment is no longer available for nearby planning.");
+  }
+
+  const onwardKind = existingWalkStep.kind;
+  const candidateLocation = locationOf(point);
+  const fromOrigin = makeRouteStep(
+    "walk",
+    origin,
+    candidateLocation,
+    fromOriginLeg,
+    existingWalkStep.parkingLocation,
+    point,
+  );
+  fromOrigin.path = withExactEndpoints(fromOriginLeg.path, origin, candidateLocation);
+  const deliveryStep = makeStationaryStep(
+    "deliver",
+    candidateLocation,
+    DELIVERY_DURATION_MS,
+    existingWalkStep.parkingLocation,
+    point,
+  );
+  const toNext = makeRouteStep(
+    onwardKind,
+    candidateLocation,
+    existingWalkStep.to,
+    toNextLeg,
+    existingWalkStep.parkingLocation,
+    onwardKind === "walk" ? nextDelivery : undefined,
+  );
+  toNext.path = withExactEndpoints(toNextLeg.path, candidateLocation, existingWalkStep.to);
+  if (onwardKind === "walk-return") {
+    toNext.addressKey = existingWalkStep.addressKey;
+    toNext.address = existingWalkStep.address;
+  }
+  const steps = [
+    ...plan.steps.slice(0, nextWalkStepIndex),
+    fromOrigin,
+    deliveryStep,
+    toNext,
+    ...plan.steps.slice(nextWalkStepIndex + 1),
+  ];
+
+  return {
+    ...plan,
+    deliveries: [
+      ...plan.deliveries.slice(0, completedDeliveryCount),
+      point,
+      ...plan.deliveries.slice(completedDeliveryCount),
+    ],
+    walkingPaths: steps
+      .filter((step) => step.kind === "walk" || step.kind === "walk-return")
+      .map((step) => step.path),
+    totalDistanceMeters:
+      plan.totalDistanceMeters -
+      existingWalkStep.distanceMeters +
+      fromOriginLeg.distanceMeters +
+      toNextLeg.distanceMeters,
+    steps,
+  };
 }
 
 export function buildDeliverySimulationPlan(
@@ -431,6 +683,40 @@ export function buildDeliverySimulationPlan(
 
 export function getSimulationDuration(steps: SimulationStep[]): number {
   return steps.reduce((total, step) => total + step.durationMs, 0);
+}
+
+export function advanceSimulationTime(
+  steps: SimulationStep[],
+  elapsedMs: number,
+  wallClockDeltaMs: number,
+  speed: number,
+): number {
+  const totalDuration = getSimulationDuration(steps);
+  let elapsed = Math.max(0, Math.min(elapsedMs, totalDuration));
+  let remainingWallClockMs = Math.max(0, wallClockDeltaMs);
+
+  while (remainingWallClockMs > 0 && elapsed < totalDuration) {
+    let stepStart = 0;
+    const step = steps.find((candidate) => {
+      const stepEnd = stepStart + candidate.durationMs;
+      if (elapsed < stepEnd) return true;
+      stepStart = stepEnd;
+      return false;
+    });
+    if (!step) return totalDuration;
+
+    const playbackMultiplier = step.kind === "cycle-wait" ? 1 : speed;
+    const stepEnd = stepStart + step.durationMs;
+    const wallClockToStepEnd = (stepEnd - elapsed) / playbackMultiplier;
+    if (remainingWallClockMs < wallClockToStepEnd) {
+      return elapsed + remainingWallClockMs * playbackMultiplier;
+    }
+
+    remainingWallClockMs -= wallClockToStepEnd;
+    elapsed = stepEnd;
+  }
+
+  return elapsed;
 }
 
 export function getSimulationFrame(steps: SimulationStep[], elapsedMs: number): SimulationFrame {
@@ -701,6 +987,7 @@ function makeRouteStep(
     to,
     path: leg.path,
     durationMs: leg.durationMs,
+    distanceMeters: leg.distanceMeters,
     parkingLocation,
     ...(delivery ? { addressKey: delivery.addressKey, address: delivery.address } : {}),
   };
@@ -719,6 +1006,7 @@ function makeStationaryStep(
     to: position,
     path: [position],
     durationMs,
+    distanceMeters: 0,
     parkingLocation,
     ...(delivery ? { addressKey: delivery.addressKey, address: delivery.address } : {}),
   };

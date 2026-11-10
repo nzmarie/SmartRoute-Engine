@@ -15,19 +15,30 @@ import {
 } from "@vis.gl/react-google-maps";
 import {
   ADDRESS_STATUS_LABELS,
+  resolveSimulationDisplayStatus,
   type AddressStatus,
 } from "@/lib/address-status";
 import {
+  advanceSimulationTime,
   buildDeliverySimulationPlan,
   buildStreetDeliveryPlan,
+  chooseNearbyDeliveryCandidate,
+  combineSimulationCyclePlans,
+  getNearbyDeliveryCandidates,
   getWalkReturnRequests,
   getWalkingRouteChunks,
   getSimulationDuration,
   getSimulationFrame,
+  getSimulationPlanningPoints,
+  insertNearbyDeliveryIntoPlan,
   isNorthShoreGeocodeResult,
+  MAX_NEARBY_DELIVERY_ADDITIONS,
+  MAX_SIMULATION_CYCLES,
   MAX_SIMULATION_DELIVERIES,
   MAX_WALK_DURATION_MS,
   orderStreetsByRouteTime,
+  selectSimulationCycleBatches,
+  SIMULATION_CYCLE_DELAY_MS,
   type SimulationFrame,
   type SimulationRouteLeg,
   type StreetDeliveryPlan,
@@ -74,10 +85,12 @@ const MapMarkers = memo(function MapMarkers({
   plannedAddresses,
   deliveredAddresses,
   activeAddressKey,
+  junkStatusUnknown,
 }: Pick<GoogleOutreachMapProps, "points" | "simulationPoints"> & {
   plannedAddresses: Set<string>;
   deliveredAddresses: Set<string>;
   activeAddressKey: string | null;
+  junkStatusUnknown: boolean;
 }) {
   const isLoaded = useApiIsLoaded();
   const [selectedPointKey, setSelectedPointKey] = useState<string | null>(null);
@@ -85,10 +98,12 @@ const MapMarkers = memo(function MapMarkers({
     const displayedKeys = new Set(points.map(markerKey));
     const additions = simulationPoints.filter(
       (point) =>
-        plannedAddresses.has(point.addressKey) && !displayedKeys.has(markerKey(point)),
+        (plannedAddresses.has(point.addressKey) ||
+          (junkStatusUnknown && point.status === "junk")) &&
+        !displayedKeys.has(markerKey(point)),
     );
     return [...points, ...additions];
-  }, [plannedAddresses, points, simulationPoints]);
+  }, [junkStatusUnknown, plannedAddresses, points, simulationPoints]);
   const selectedPoint =
     displayPoints.find((point) => markerKey(point) === selectedPointKey) ?? null;
 
@@ -97,8 +112,12 @@ const MapMarkers = memo(function MapMarkers({
   return (
     <>
       {displayPoints.map((point) => {
-        const simulatedAsSent = point.status === "unsent" && deliveredAddresses.has(point.addressKey);
-        const displayStatus = simulatedAsSent ? "sent" : point.status;
+        const isDelivered = deliveredAddresses.has(point.addressKey);
+        const displayStatus = resolveSimulationDisplayStatus(
+          point.status,
+          isDelivered,
+          junkStatusUnknown,
+        );
         const isActive = activeAddressKey === point.addressKey;
         const isPlanned = plannedAddresses.has(point.addressKey);
         return (
@@ -133,11 +152,15 @@ const MapMarkers = memo(function MapMarkers({
             </a>
             <span className="address-info-status">
               {ADDRESS_STATUS_LABELS[
-                selectedPoint.status === "unsent" && deliveredAddresses.has(selectedPoint.addressKey)
-                  ? "sent"
-                  : selectedPoint.status
+                resolveSimulationDisplayStatus(
+                  selectedPoint.status,
+                  deliveredAddresses.has(selectedPoint.addressKey),
+                  junkStatusUnknown,
+                )
               ]}
-              {selectedPoint.status === "unsent" && deliveredAddresses.has(selectedPoint.addressKey)
+              {deliveredAddresses.has(selectedPoint.addressKey) &&
+              (selectedPoint.status === "unsent" ||
+                (junkStatusUnknown && selectedPoint.status === "junk"))
                 ? " (simulation only)"
                 : ""}
             </span>
@@ -207,21 +230,36 @@ function SimulationControls({
   const [startAddress, setStartAddress] = useState("");
   const [speed, setSpeed] = useState(50);
   const [deliveryCount, setDeliveryCount] = useState("50");
+  const [cycleCount, setCycleCount] = useState("1");
+  const [junkStatusUnknown, setJunkStatusUnknown] = useState(false);
+  const [showRoute, setShowRoute] = useState(true);
   const [playbackState, setPlaybackState] = useState<PlaybackState>("idle");
   const [plan, setPlan] = useState<StreetDeliveryPlan | null>(null);
+  const [plannedCycleCount, setPlannedCycleCount] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [isCheckingNearby, setIsCheckingNearby] = useState(false);
+  const [nearbyAddedCount, setNearbyAddedCount] = useState(0);
   const elapsedRef = useRef(0);
   const reportedAddressKeysRef = useRef(new Set(simulatedDeliveryAddressKeys));
+  const nearbyCheckedAddressKeysRef = useRef(new Set<string>());
+  const nearbyAddedCountRef = useRef(0);
+  const nearbyScanGenerationRef = useRef(0);
+  const nearbyAdditionLimitRef = useRef(MAX_NEARBY_DELIVERY_ADDITIONS);
   const durationMs = plan ? getSimulationDuration(plan.steps) : 0;
+  const planningPoints = useMemo(
+    () => getSimulationPlanningPoints(simulationPoints, junkStatusUnknown),
+    [junkStatusUnknown, simulationPoints],
+  );
   const simulatedAddressKeys = useMemo(
     () => new Set(simulatedDeliveryAddressKeys),
     [simulatedDeliveryAddressKeys],
   );
-  const unsentCount = simulationPoints.filter(
+  const eligibleAddressCount = planningPoints.filter(
     ({ addressKey, status }) => status === "unsent" && !simulatedAddressKeys.has(addressKey),
   ).length;
-  const maxDeliveries = Math.min(MAX_SIMULATION_DELIVERIES, unsentCount);
+  const maxDeliveries = Math.min(MAX_SIMULATION_DELIVERIES, eligibleAddressCount);
+  const eligibleAddressLabel = junkStatusUnknown ? "Unsent or unknown Junk mail" : "Unsent";
   const parsedDeliveryCount = Number(deliveryCount);
   const normalizedDeliveryCount =
     maxDeliveries === 0 || !deliveryCount.trim()
@@ -232,6 +270,11 @@ function SimulationControls({
   const requestedCount = Number(normalizedDeliveryCount);
   const isDeliveryCountValid =
     Number.isInteger(requestedCount) && requestedCount >= 1 && requestedCount <= maxDeliveries;
+  const parsedCycleCount = Number(cycleCount);
+  const isCycleCountValid =
+    Number.isInteger(parsedCycleCount) &&
+    parsedCycleCount >= 1 &&
+    parsedCycleCount <= MAX_SIMULATION_CYCLES;
   const frame: SimulationFrame | null = plan
     ? getSimulationFrame(plan.steps, elapsedMs)
     : null;
@@ -267,6 +310,193 @@ function SimulationControls({
     }
     onSimulatedDeliveryChange([...reportedAddressKeysRef.current]);
   }, [deliveredAddressKey, onSimulatedDeliveryChange, plan]);
+
+  useEffect(() => {
+    if (
+      playbackState !== "playing" ||
+      !plan ||
+      (frame?.kind !== "walk" && frame?.kind !== "walk-return") ||
+      deliveredCount === 0 ||
+      deliveredCount > plan.deliveries.length ||
+      nearbyAddedCountRef.current >= nearbyAdditionLimitRef.current ||
+      !routesLibrary
+    ) {
+      return;
+    }
+
+    const completedDelivery = plan.deliveries[deliveredCount - 1]!;
+    const nextDelivery = plan.deliveries[deliveredCount];
+    if (nearbyCheckedAddressKeysRef.current.has(completedDelivery.addressKey)) return;
+    nearbyCheckedAddressKeysRef.current.add(completedDelivery.addressKey);
+
+    const candidates = getNearbyDeliveryCandidates(
+      frame.position,
+      planningPoints,
+      new Set([
+        ...plan.deliveries.map(({ addressKey }) => addressKey),
+        ...simulatedAddressKeys,
+      ]),
+    );
+    if (!candidates.length) return;
+
+    const generation = nearbyScanGenerationRef.current;
+    const origin = frame.position;
+    const destination =
+      frame.kind === "walk"
+        ? nextDelivery
+          ? { lat: nextDelivery.lat, lng: nextDelivery.lng }
+          : null
+        : frame.parkedPosition;
+    if (!destination) return;
+    const candidateLocations = candidates.map(({ lat, lng }) => ({ lat, lng }));
+
+    void (async () => {
+      setError(null);
+      setPlaybackState("paused");
+      setIsCheckingNearby(true);
+      try {
+        const [fromOriginResult, toNextMatrixResult] = await Promise.all([
+          routesLibrary.RouteMatrix.computeRouteMatrix({
+            origins: [origin],
+            destinations: [...candidateLocations, destination],
+            travelMode: "WALKING",
+            fields: ["condition", "durationMillis"],
+          }),
+          routesLibrary.RouteMatrix.computeRouteMatrix({
+            origins: candidateLocations,
+            destinations: [destination],
+            travelMode: "WALKING",
+            fields: ["condition", "durationMillis"],
+          }),
+        ]);
+        if (generation !== nearbyScanGenerationRef.current) return;
+
+        const fromOriginRows: Array<{
+          items: Array<{
+            condition?: string | null;
+            durationMillis?: number | null;
+          }>;
+        }> = fromOriginResult.matrix.rows;
+        const toNextRows: Array<{
+          items: Array<{
+            condition?: string | null;
+            durationMillis?: number | null;
+          }>;
+        }> = toNextMatrixResult.matrix.rows;
+        if (
+          fromOriginRows.length !== 1 ||
+          fromOriginRows[0]!.items.length !== candidates.length + 1 ||
+          toNextRows.length !== candidates.length ||
+          toNextRows.some((row) => row.items.length !== 1)
+        ) {
+          throw new Error("Google Maps returned incomplete nearby walking route durations.");
+        }
+        const duration = (item: {
+          condition?: string | null;
+          durationMillis?: number | null;
+        }) => {
+          return item.condition === "ROUTE_EXISTS" ? item.durationMillis ?? null : null;
+        };
+        const baselineDurationMs = duration(fromOriginRows[0]!.items[candidates.length]!);
+        const candidate = chooseNearbyDeliveryCandidate(
+          candidates,
+          candidates.map((_, index) => duration(fromOriginRows[0]!.items[index]!)),
+          toNextRows.map((row) => duration(row.items[0]!)),
+          baselineDurationMs,
+        );
+        if (!candidate) return;
+
+        const [toCandidateResult, toNextResult] = await Promise.all([
+          routesLibrary.Route.computeRoutes({
+            origin,
+            destination: { lat: candidate.point.lat, lng: candidate.point.lng },
+            travelMode: "WALKING",
+            polylineQuality: "HIGH_QUALITY",
+            fields: ["path", "legs"],
+          }),
+          routesLibrary.Route.computeRoutes({
+            origin: { lat: candidate.point.lat, lng: candidate.point.lng },
+            destination,
+            travelMode: "WALKING",
+            polylineQuality: "HIGH_QUALITY",
+            fields: ["path", "legs"],
+          }),
+        ]);
+        if (generation !== nearbyScanGenerationRef.current) return;
+
+        const fromOriginLeg = toSimulationRouteLeg(
+          toCandidateResult.routes?.[0]?.legs?.[0],
+        );
+        const toNextLeg = toSimulationRouteLeg(toNextResult.routes?.[0]?.legs?.[0]);
+        if (
+          !chooseNearbyDeliveryCandidate(
+            [candidate.point],
+            [fromOriginLeg.durationMs],
+            [toNextLeg.durationMs],
+            baselineDurationMs,
+          )
+        ) {
+          return;
+        }
+        let currentStepIndex = -1;
+        let stepStart = 0;
+        let accumulatedDuration = 0;
+        for (let index = 0; index < plan.steps.length; index += 1) {
+          const step = plan.steps[index]!;
+          if (
+            elapsedMs >= accumulatedDuration &&
+            elapsedMs < accumulatedDuration + step.durationMs &&
+            step.kind === frame.kind
+          ) {
+            currentStepIndex = index;
+            stepStart = accumulatedDuration;
+            break;
+          }
+          accumulatedDuration += step.durationMs;
+        }
+        if (currentStepIndex < 0) {
+          throw new Error("The current walking segment changed before nearby planning completed.");
+        }
+        const updatedPlan = insertNearbyDeliveryIntoPlan(
+          plan,
+          deliveredCount,
+          currentStepIndex,
+          candidate.point,
+          origin,
+          fromOriginLeg,
+          toNextLeg,
+        );
+        elapsedRef.current = stepStart;
+        setElapsedMs(stepStart);
+        setPlan(updatedPlan);
+        nearbyAddedCountRef.current += 1;
+        setNearbyAddedCount(nearbyAddedCountRef.current);
+      } catch (nearbyError) {
+        if (generation === nearbyScanGenerationRef.current) {
+          setError(
+            `Nearby address check failed; continuing the planned route. ${
+              nearbyError instanceof Error ? nearbyError.message : "Unknown route error."
+            }`,
+          );
+        }
+      } finally {
+        if (generation === nearbyScanGenerationRef.current) {
+          setIsCheckingNearby(false);
+          setPlaybackState("playing");
+        }
+      }
+    })();
+  }, [
+    deliveredCount,
+    elapsedMs,
+    frame,
+    plan,
+    playbackState,
+    planningPoints,
+    routesLibrary,
+    simulatedAddressKeys,
+  ]);
+
   useEffect(() => {
     if (playbackState !== "playing" || !plan) return;
 
@@ -274,9 +504,11 @@ function SimulationControls({
     let previousTimestamp: number | null = null;
     const animate = (timestamp: number) => {
       if (previousTimestamp !== null) {
-        elapsedRef.current = Math.min(
-          durationMs,
-          elapsedRef.current + (timestamp - previousTimestamp) * speed,
+        elapsedRef.current = advanceSimulationTime(
+          plan.steps,
+          elapsedRef.current,
+          timestamp - previousTimestamp,
+          speed,
         );
         setElapsedMs(elapsedRef.current);
         if (elapsedRef.current >= durationMs) {
@@ -298,6 +530,11 @@ function SimulationControls({
     if (!isLoaded || !geocodingLibrary || !routesLibrary || !startAddress.trim()) return;
 
     setError(null);
+    nearbyScanGenerationRef.current += 1;
+    setIsCheckingNearby(false);
+    setNearbyAddedCount(0);
+    nearbyAddedCountRef.current = 0;
+    nearbyCheckedAddressKeysRef.current.clear();
     setPlan(null);
     elapsedRef.current = 0;
     setElapsedMs(0);
@@ -325,151 +562,177 @@ function SimulationControls({
 
       const start = result.geometry.location.toJSON();
       if (!isDeliveryCountValid) {
-        throw new Error(`Choose between 1 and ${maxDeliveries} Unsent addresses.`);
+        throw new Error(`Choose between 1 and ${maxDeliveries} eligible addresses.`);
+      }
+      if (!isCycleCountValid) {
+        throw new Error(`Choose between 1 and ${MAX_SIMULATION_CYCLES} runs.`);
       }
 
-      const selectedPlan = buildStreetDeliveryPlan(
+      const cycleBatches = selectSimulationCycleBatches(
         start,
-        simulationPoints,
+        planningPoints,
         requestedCount,
+        parsedCycleCount,
         simulatedAddressKeys,
       );
-      const streetOrder = await orderStreetsByRouteTime(
-        start,
-        selectedPlan.deliveries,
-        async (origin, destinations, travelMode) => {
-          const { matrix } = await routesLibrary.RouteMatrix.computeRouteMatrix({
-            origins: [origin],
-            destinations,
-            travelMode,
-            fields: ["condition", "durationMillis"],
-          });
-          const items = matrix.rows[0]?.items ?? [];
-          if (items.length !== destinations.length) {
-            throw new Error("Google Maps returned incomplete street route durations.");
-          }
-          return items.map(
-            (item: {
-              condition?: string | null;
-              durationMillis?: number | null;
-            }) =>
-            item.condition === "ROUTE_EXISTS" ? item.durationMillis ?? null : null,
-          );
-        },
-      );
-      const deliveryPlan = {
-        ...selectedPlan,
-        deliveries: streetOrder.deliveries,
-        drivingStopAddressKeys: streetOrder.drivingStopAddressKeys,
-      };
-      const firstDelivery = deliveryPlan.deliveries[0]!;
-      const driveOutResult = await routesLibrary.Route.computeRoutes({
-        origin: start,
-        destination: { lat: firstDelivery.lat, lng: firstDelivery.lng },
-        travelMode: "DRIVING",
-        polylineQuality: "HIGH_QUALITY",
-        fields: ["path", "legs"],
-      });
-      const driveOutLeg = toSimulationRouteLeg(driveOutResult.routes?.[0]?.legs?.[0]);
-
-      const drivingStopAddressKeys = new Set(deliveryPlan.drivingStopAddressKeys);
-      const walkingLegs: Array<SimulationRouteLeg | null> = Array.from(
-        { length: deliveryPlan.deliveries.length - 1 },
-        () => null,
-      );
-      for (const chunk of getWalkingRouteChunks(
-        deliveryPlan.deliveries,
-        drivingStopAddressKeys,
-      )) {
-        const walkingResult = await routesLibrary.Route.computeRoutes({
-          origin: { lat: chunk.origin.lat, lng: chunk.origin.lng },
-          destination: { lat: chunk.destination.lat, lng: chunk.destination.lng },
-          intermediates: chunk.intermediates.map(({ lat, lng }) => ({
-            location: { lat, lng },
-          })),
-          travelMode: "WALKING",
-          optimizeWaypointOrder: false,
-          polylineQuality: "HIGH_QUALITY",
-          fields: ["path", "legs"],
-        });
-        const routeLegs = walkingResult.routes?.[0]?.legs;
-        if (!routeLegs?.length) {
-          throw new Error("Google Maps could not calculate walking routes for the selected addresses.");
-        }
-        const expectedLegCount = chunk.intermediates.length + 1;
-        if (routeLegs.length !== expectedLegCount) {
-          throw new Error("Google Maps returned an incomplete walking route for the selected addresses.");
-        }
-        for (let index = 0; index < routeLegs.length; index += 1) {
-          walkingLegs[chunk.startIndex + index] = toSimulationRouteLeg(routeLegs[index]);
-        }
+      if (!cycleBatches.length) {
+        throw new Error("No mapped eligible addresses remain for this simulation.");
       }
 
-      const longDriveLegs = new globalThis.Map<number, SimulationRouteLeg>();
-      let parking = { lat: firstDelivery.lat, lng: firstDelivery.lng };
-      for (let index = 0; index < walkingLegs.length; index += 1) {
-        const nextDelivery = deliveryPlan.deliveries[index + 1]!;
-        const walkingLeg = walkingLegs[index];
-        if (
-          !drivingStopAddressKeys.has(nextDelivery.addressKey) &&
-          (!walkingLeg || walkingLeg.durationMs <= MAX_WALK_DURATION_MS)
-        ) {
-          continue;
-        }
-
-        const driveResult = await routesLibrary.Route.computeRoutes({
-          origin: parking,
-          destination: { lat: nextDelivery.lat, lng: nextDelivery.lng },
+      const routedCycles: StreetDeliveryPlan[] = [];
+      for (const batch of cycleBatches) {
+        const selectedPlan: StreetDeliveryPlan = {
+          start,
+          deliveries: batch,
+          drivingStopAddressKeys: [],
+          drivingPaths: [],
+          walkingPaths: [],
+          returnDrivePath: [],
+          totalDistanceMeters: 0,
+          steps: [],
+        };
+        const streetOrder = await orderStreetsByRouteTime(
+          start,
+          selectedPlan.deliveries,
+          async (origin, destinations, travelMode) => {
+            const { matrix } = await routesLibrary.RouteMatrix.computeRouteMatrix({
+              origins: [origin],
+              destinations,
+              travelMode,
+              fields: ["condition", "durationMillis"],
+            });
+            const items = matrix.rows[0]?.items ?? [];
+            if (items.length !== destinations.length) {
+              throw new Error("Google Maps returned incomplete street route durations.");
+            }
+            return items.map(
+              (item: {
+                condition?: string | null;
+                durationMillis?: number | null;
+              }) =>
+              item.condition === "ROUTE_EXISTS" ? item.durationMillis ?? null : null,
+            );
+          },
+        );
+        const deliveryPlan = {
+          ...selectedPlan,
+          deliveries: streetOrder.deliveries,
+          drivingStopAddressKeys: streetOrder.drivingStopAddressKeys,
+        };
+        const firstDelivery = deliveryPlan.deliveries[0]!;
+        const driveOutResult = await routesLibrary.Route.computeRoutes({
+          origin: start,
+          destination: { lat: firstDelivery.lat, lng: firstDelivery.lng },
           travelMode: "DRIVING",
           polylineQuality: "HIGH_QUALITY",
           fields: ["path", "legs"],
         });
-        longDriveLegs.set(
-          index,
-          toSimulationRouteLeg(driveResult.routes?.[0]?.legs?.[0]),
+        const driveOutLeg = toSimulationRouteLeg(driveOutResult.routes?.[0]?.legs?.[0]);
+        const drivingStopAddressKeys = new Set(deliveryPlan.drivingStopAddressKeys);
+        const walkingLegs: Array<SimulationRouteLeg | null> = Array.from(
+          { length: deliveryPlan.deliveries.length - 1 },
+          () => null,
         );
-        parking = { lat: nextDelivery.lat, lng: nextDelivery.lng };
-      }
+        for (const chunk of getWalkingRouteChunks(
+          deliveryPlan.deliveries,
+          drivingStopAddressKeys,
+        )) {
+          const walkingResult = await routesLibrary.Route.computeRoutes({
+            origin: { lat: chunk.origin.lat, lng: chunk.origin.lng },
+            destination: { lat: chunk.destination.lat, lng: chunk.destination.lng },
+            intermediates: chunk.intermediates.map(({ lat, lng }) => ({
+              location: { lat, lng },
+            })),
+            travelMode: "WALKING",
+            optimizeWaypointOrder: false,
+            polylineQuality: "HIGH_QUALITY",
+            fields: ["path", "legs"],
+          });
+          const routeLegs = walkingResult.routes?.[0]?.legs;
+          if (!routeLegs?.length) {
+            throw new Error("Google Maps could not calculate walking routes for the selected addresses.");
+          }
+          const expectedLegCount = chunk.intermediates.length + 1;
+          if (routeLegs.length !== expectedLegCount) {
+            throw new Error("Google Maps returned an incomplete walking route for the selected addresses.");
+          }
+          for (let index = 0; index < routeLegs.length; index += 1) {
+            walkingLegs[chunk.startIndex + index] = toSimulationRouteLeg(routeLegs[index]);
+          }
+        }
 
-      const walkReturnLegs = new globalThis.Map<number, SimulationRouteLeg>();
-      for (const request of getWalkReturnRequests(
-        deliveryPlan.deliveries,
-        walkingLegs,
-        drivingStopAddressKeys,
-      )) {
-        const returnResult = await routesLibrary.Route.computeRoutes({
-          origin: request.origin,
-          destination: request.destination,
-          travelMode: "WALKING",
+        const longDriveLegs = new globalThis.Map<number, SimulationRouteLeg>();
+        let parking = { lat: firstDelivery.lat, lng: firstDelivery.lng };
+        for (let index = 0; index < walkingLegs.length; index += 1) {
+          const nextDelivery = deliveryPlan.deliveries[index + 1]!;
+          const walkingLeg = walkingLegs[index];
+          if (
+            !drivingStopAddressKeys.has(nextDelivery.addressKey) &&
+            (!walkingLeg || walkingLeg.durationMs <= MAX_WALK_DURATION_MS)
+          ) {
+            continue;
+          }
+
+          const driveResult = await routesLibrary.Route.computeRoutes({
+            origin: parking,
+            destination: { lat: nextDelivery.lat, lng: nextDelivery.lng },
+            travelMode: "DRIVING",
+            polylineQuality: "HIGH_QUALITY",
+            fields: ["path", "legs"],
+          });
+          longDriveLegs.set(
+            index,
+            toSimulationRouteLeg(driveResult.routes?.[0]?.legs?.[0]),
+          );
+          parking = { lat: nextDelivery.lat, lng: nextDelivery.lng };
+        }
+
+        const walkReturnLegs = new globalThis.Map<number, SimulationRouteLeg>();
+        for (const request of getWalkReturnRequests(
+          deliveryPlan.deliveries,
+          walkingLegs,
+          drivingStopAddressKeys,
+        )) {
+          const returnResult = await routesLibrary.Route.computeRoutes({
+            origin: request.origin,
+            destination: request.destination,
+            travelMode: "WALKING",
+            polylineQuality: "HIGH_QUALITY",
+            fields: ["path", "legs"],
+          });
+          const returnLeg = returnResult.routes?.[0]?.legs?.[0];
+          if (!returnLeg) {
+            throw new Error("Google Maps could not calculate a direct walking route back to the marked parking point.");
+          }
+          walkReturnLegs.set(
+            request.afterDeliveryIndex,
+            toSimulationRouteLeg(returnLeg),
+          );
+        }
+
+        const driveHomeResult = await routesLibrary.Route.computeRoutes({
+          origin: parking,
+          destination: start,
+          travelMode: "DRIVING",
           polylineQuality: "HIGH_QUALITY",
           fields: ["path", "legs"],
         });
-        const returnLeg = returnResult.routes?.[0]?.legs?.[0];
-        if (!returnLeg) {
-          throw new Error("Google Maps could not calculate a direct walking route back to the marked parking point.");
-        }
-        walkReturnLegs.set(
-          request.afterDeliveryIndex,
-          toSimulationRouteLeg(returnLeg),
+        const driveHomeLeg = toSimulationRouteLeg(driveHomeResult.routes?.[0]?.legs?.[0]);
+        routedCycles.push(
+          buildDeliverySimulationPlan(
+            deliveryPlan,
+            driveOutLeg,
+            walkingLegs,
+            longDriveLegs,
+            walkReturnLegs,
+            driveHomeLeg,
+          ),
         );
       }
 
-      const driveHomeResult = await routesLibrary.Route.computeRoutes({
-        origin: parking,
-        destination: start,
-        travelMode: "DRIVING",
-        polylineQuality: "HIGH_QUALITY",
-        fields: ["path", "legs"],
-      });
-      const driveHomeLeg = toSimulationRouteLeg(driveHomeResult.routes?.[0]?.legs?.[0]);
-      const nextPlan = buildDeliverySimulationPlan(
-        deliveryPlan,
-        driveOutLeg,
-        walkingLegs,
-        longDriveLegs,
-        walkReturnLegs,
-        driveHomeLeg,
-      );
+      const nextPlan = combineSimulationCyclePlans(routedCycles);
+      nearbyAdditionLimitRef.current = MAX_NEARBY_DELIVERY_ADDITIONS * routedCycles.length;
+      setPlannedCycleCount(routedCycles.length);
       setPlan(nextPlan);
       elapsedRef.current = 0;
       setElapsedMs(0);
@@ -502,11 +765,17 @@ function SimulationControls({
   }
 
   function resetSimulation() {
+    nearbyScanGenerationRef.current += 1;
     elapsedRef.current = 0;
     setElapsedMs(0);
     setPlan(null);
+    setPlannedCycleCount(0);
     setPlaybackState("idle");
     setError(null);
+    setIsCheckingNearby(false);
+    setNearbyAddedCount(0);
+    nearbyAddedCountRef.current = 0;
+    nearbyCheckedAddressKeysRef.current.clear();
     reportedAddressKeysRef.current.clear();
     onSimulatedDeliveryChange(null);
   }
@@ -529,16 +798,17 @@ function SimulationControls({
           <div>
             <h2>Delivery simulation</h2>
             <p>
-              Choose a target of up to 50 Unsent addresses. Complete each started street, even if
-              that takes the total above your target. Walk to nearby streets (up to 10 minutes),
-              drive to farther ones, then return to your start.
+              Choose a target of up to 50 Unsent addresses. Optionally treat Junk mail as unknown
+              until simulated delivery. Complete each started street, even if that takes the total
+              above your target; nearby eligible addresses may also be added on short, low-detour
+              walks. Complete streets and nearby additions may increase the per-run target.
             </p>
           </div>
           <span className="simulation-badge">Demo only · no delivery data is changed</span>
         </div>
         <form className="simulation-form" onSubmit={(event) => void startSimulation(event)}>
           <label className="simulation-start-control">
-            <span>North Shore start address</span>
+            <span>Start address</span>
             <input
               value={startAddress}
               onChange={(event) => setStartAddress(event.target.value)}
@@ -549,14 +819,26 @@ function SimulationControls({
             />
           </label>
           <label className="simulation-speed-control">
-            <span>Target addresses (max {maxDeliveries})</span>
+            <span>Runs (max {MAX_SIMULATION_CYCLES})</span>
+            <input
+              type="number"
+              min={1}
+              max={MAX_SIMULATION_CYCLES}
+              value={cycleCount}
+              onChange={(event) => setCycleCount(event.target.value)}
+              disabled={["preparing", "playing", "paused"].includes(playbackState)}
+              required
+            />
+          </label>
+          <label className="simulation-speed-control">
+            <span>Target per run (max {maxDeliveries})</span>
             <input
               type="number"
               min={1}
               max={maxDeliveries}
               value={normalizedDeliveryCount}
               onChange={(event) => setDeliveryCount(event.target.value)}
-              disabled={playbackState === "preparing" || maxDeliveries === 0}
+              disabled={["preparing", "playing", "paused"].includes(playbackState) || maxDeliveries === 0}
               required
             />
           </label>
@@ -572,6 +854,25 @@ function SimulationControls({
               <option value={50}>50×</option>
             </select>
           </label>
+          <label className="simulation-checkbox-control">
+            <input
+              type="checkbox"
+              checked={junkStatusUnknown}
+              onChange={(event) => setJunkStatusUnknown(event.target.checked)}
+              disabled={["preparing", "playing", "paused"].includes(playbackState)}
+            />
+            <span>Junk status unknown</span>
+          </label>
+          <label className="simulation-checkbox-control route-visibility-control">
+            <input
+              type="checkbox"
+              role="switch"
+              checked={showRoute}
+              onChange={(event) => setShowRoute(event.target.checked)}
+              aria-label="Show route"
+            />
+            <span>Show route</span>
+          </label>
           {playbackState === "playing" ? (
             <button
               className="simulation-button secondary"
@@ -585,8 +886,9 @@ function SimulationControls({
               className="simulation-button"
               type="button"
               onClick={() => setPlaybackState("playing")}
+              disabled={isCheckingNearby}
             >
-              Resume
+              {isCheckingNearby ? "Checking nearby…" : "Resume"}
             </button>
           ) : (
             <button
@@ -598,7 +900,8 @@ function SimulationControls({
                 !routesLibrary ||
                 playbackState === "preparing" ||
                 !startAddress.trim() ||
-                !isDeliveryCountValid
+                !isDeliveryCountValid ||
+                !isCycleCountValid
               }
             >
               {playbackState === "preparing"
@@ -614,53 +917,36 @@ function SimulationControls({
             </button>
           ) : null}
         </form>
-        <div className="simulation-status" aria-live="polite">
-          <strong>
-            {playbackState === "preparing" ? "Finding Google Maps routes…" : statusText[playbackState]}
-          </strong>
-          <span>
-            {unsentCount === 0
-              ? "No mapped, not-yet-simulated Unsent addresses are available."
-              : `${unsentCount} Unsent addresses remain; choose a target up to ${maxDeliveries}. Previously simulated addresses are excluded. Streets are completed in full, so the final total may exceed the target.`}
-          </span>
+        <div className="simulation-live-strip" aria-live="polite">
           {plan ? (
             <>
-              <span>
-                {deliveredCount} / {plan.deliveries.length} delivered ·{" "}
-                {Math.max(0, plan.deliveries.length - deliveredCount)} planned remaining
-              </span>
-              <span>
-                Green ring marks addresses selected for this run. All streets within a 10-minute
-                radius of the first stop are included before filling the target; Google Maps
-                route-time estimates determine walking and driving between streets.
-              </span>
               <span>{(plan.totalDistanceMeters / 1_000).toFixed(1)} km on Google Maps routes</span>
               <span>{progress}%</span>
-              {activeAddress ? (
-                <span>
-                  {frame?.delivering ? "Delivering at " : frame?.kind === "drive" ? "Driving to " : "Walking to "}
-                  {activeAddress}
-                </span>
-              ) : frame?.kind === "walk-return" ? (
-                <span>Walking back to the marked parking point</span>
-              ) : frame?.kind === "board" && nextDelivery ? (
-                <span>At the marked parking point · boarding vehicle to {nextDelivery.address}</span>
-              ) : frame?.kind === "drive-return" ? (
-                <span>Driving back to start</span>
-              ) : frame?.kind === "complete" ? (
-                <span>
-                  This run is complete. Remaining red points were not selected; start again to
-                  plan the next batch without revisiting simulation-only sent addresses.
-                </span>
-              ) : null}
-              {nextDelivery && (frame?.kind === "walk-return" || frame?.kind === "park") ? (
-                <span>
-                  {frame.kind === "walk-return" ? "Next stop after boarding: " : "Next planned address: "}
-                  {nextDelivery.address}
-                </span>
-              ) : null}
+              <strong>
+                {isCheckingNearby
+                  ? "Checking nearby addresses…"
+                  : frame?.kind === "cycle-wait"
+                    ? "Waiting 10 seconds before the next run"
+                    : activeAddress
+                      ? `${frame?.delivering ? "Delivering at" : frame?.kind === "drive" ? "Driving to" : "Walking to"} ${activeAddress}`
+                      : frame?.kind === "walk-return"
+                        ? "Walking back to the marked parking point"
+                        : frame?.kind === "board" && nextDelivery
+                          ? `Boarding vehicle to ${nextDelivery.address}`
+                          : frame?.kind === "drive-return"
+                            ? "Driving back to start"
+                            : statusText[playbackState]}
+              </strong>
             </>
-          ) : null}
+          ) : (
+            <strong>
+              {isCheckingNearby
+                ? "Checking nearby walking routes…"
+                : playbackState === "preparing"
+                  ? "Finding Google Maps routes…"
+                  : statusText[playbackState]}
+            </strong>
+          )}
         </div>
         <div
           className="simulation-progress-track"
@@ -672,18 +958,6 @@ function SimulationControls({
         >
           <span style={{ width: `${progress}%` }} />
         </div>
-        <p className="simulation-disclaimer">
-          Addresses are selected nearest to the start, then ordered by nearest neighbor from the
-          current position. Google Maps calculates all displayed road routes. Walking legs over 10
-          minutes trigger a drive to the next address. Route requests may incur Google Maps Platform
-          charges. Delivery status changes exist only in this simulation; CRM, Sent, and Junk
-          records remain unchanged.
-        </p>
-        {error ? (
-          <p className="simulation-error" role="alert">
-            {error}
-          </p>
-        ) : null}
       </section>
       <Map
         className="google-map"
@@ -707,27 +981,47 @@ function SimulationControls({
           plannedAddresses={plannedAddresses}
           deliveredAddresses={deliveredAddresses}
           activeAddressKey={activeAddressKey}
+          junkStatusUnknown={junkStatusUnknown}
         />
         {plan ? (
           <>
-            {plan.drivingPaths.map((path, index) => (
-              <Polyline
-                key={`drive-${index}`}
-                path={path}
-                options={{ strokeColor: "#2563eb", strokeOpacity: 0.8, strokeWeight: 5, zIndex: 5 }}
-              />
-            ))}
-            <Polyline
-              path={plan.returnDrivePath}
-              options={{ strokeColor: "#2563eb", strokeOpacity: 0.8, strokeWeight: 5, zIndex: 5 }}
-            />
-            {plan.walkingPaths.map((path, index) => (
-              <Polyline
-                key={`walk-${index}`}
-                path={path}
-                options={{ strokeColor: "#16a34a", strokeOpacity: 0.8, strokeWeight: 4, zIndex: 4 }}
-              />
-            ))}
+            {showRoute ? (
+              <>
+                {plan.drivingPaths.map((path, index) => (
+                  <Polyline
+                    key={`drive-${index}`}
+                    path={path}
+                    options={{
+                      strokeColor: "#2563eb",
+                      strokeOpacity: 0.8,
+                      strokeWeight: 5,
+                      zIndex: 5,
+                    }}
+                  />
+                ))}
+                <Polyline
+                  path={plan.returnDrivePath}
+                  options={{
+                    strokeColor: "#2563eb",
+                    strokeOpacity: 0.8,
+                    strokeWeight: 5,
+                    zIndex: 5,
+                  }}
+                />
+                {plan.walkingPaths.map((path, index) => (
+                  <Polyline
+                    key={`walk-${index}`}
+                    path={path}
+                    options={{
+                      strokeColor: "#16a34a",
+                      strokeOpacity: 0.8,
+                      strokeWeight: 4,
+                      zIndex: 4,
+                    }}
+                  />
+                ))}
+              </>
+            ) : null}
             {frame ? (
               <>
                 {!["drive", "drive-return", "complete"].includes(frame.kind) ? (
@@ -783,6 +1077,63 @@ function SimulationControls({
           </>
         ) : null}
       </Map>
+      <details className="simulation-details">
+        <summary>Simulation details and route status</summary>
+        <div className="simulation-details-content">
+          <div className="simulation-status" aria-live="polite">
+            <strong>
+              {isCheckingNearby
+                ? "Checking nearby walking routes…"
+                : playbackState === "preparing"
+                  ? "Finding Google Maps routes…"
+                  : statusText[playbackState]}
+            </strong>
+            <span>
+              {eligibleAddressCount === 0
+                ? `No mapped, not-yet-simulated ${eligibleAddressLabel} addresses are available.`
+                : `${eligibleAddressCount} ${eligibleAddressLabel} addresses remain; choose a target up to ${maxDeliveries}. Previously simulated addresses are excluded.`}
+            </span>
+            {plan ? (
+              <>
+                <span>
+                  {deliveredCount} / {plan.deliveries.length} delivered ·{" "}
+                  {Math.max(0, plan.deliveries.length - deliveredCount)} planned remaining
+                </span>
+                <span>
+                  {plannedCycleCount} run{plannedCycleCount === 1 ? "" : "s"} planned; each run
+                  returns to the starting address and waits 10 seconds before the next.
+                </span>
+                <span>
+                  Green rings mark addresses selected for this run. Streets are ordered using
+                  Google Maps route-time estimates; addresses within a street use nearest-neighbor
+                  ordering.
+                </span>
+                <span>
+                  Each run checks up to 8 nearby eligible addresses within 250 m and may add up to{" "}
+                  {MAX_NEARBY_DELIVERY_ADDITIONS} if walking legs are under 10 minutes and the
+                  detour is at most 3 minutes. Complete streets can exceed the requested target.
+                  Added nearby: {nearbyAddedCount}.
+                </span>
+                {frame?.kind === "walk-return" && nextDelivery ? (
+                  <span>Next stop after boarding: {nextDelivery.address}</span>
+                ) : null}
+                {frame?.kind === "cycle-wait" ? (
+                  <span>Next run starts from the saved starting address in 10 seconds.</span>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+          <p className="simulation-disclaimer">
+            Route requests may incur Google Maps Platform charges. Delivery status changes exist
+            only in this simulation; CRM, Sent, and Junk records remain unchanged.
+          </p>
+          {error ? (
+            <p className="simulation-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+        </div>
+      </details>
     </>
   );
 }
