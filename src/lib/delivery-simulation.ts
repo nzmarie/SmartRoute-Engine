@@ -36,6 +36,17 @@ export type RouteDurationLookup = (
   travelMode: SimulationTravelMode,
 ) => Promise<Array<number | null>>;
 
+export interface SimulationRouteCost {
+  durationMs: number;
+  distanceMeters: number;
+}
+
+export type RouteCostLookup = (
+  origins: SimulationLocation[],
+  destinations: SimulationLocation[],
+  travelMode: SimulationTravelMode,
+) => Promise<Array<Array<SimulationRouteCost | null>>>;
+
 export interface SimulationStep {
   kind: SimulationStepKind;
   from: SimulationLocation;
@@ -52,6 +63,7 @@ export interface StreetDeliveryPlan {
   start: SimulationLocation;
   deliveries: MapAddressPoint[];
   drivingStopAddressKeys: string[];
+  supportsNearbyDeliveryInsertion?: boolean;
   drivingPaths: SimulationLocation[][];
   walkingPaths: SimulationLocation[][];
   returnDrivePath: SimulationLocation[];
@@ -87,10 +99,61 @@ export const MAX_SIMULATION_DELIVERIES = 50;
 export const MAX_SIMULATION_CYCLES = 10;
 export const SIMULATION_CYCLE_DELAY_MS = 10_000;
 export const MAX_WALK_DURATION_MS = 10 * 60 * 1_000;
+export const MAX_WALK_SERVICE_AREA_DISTANCE_METERS = 1_000;
 export const MAX_NEARBY_DELIVERY_ADDITIONS = 5;
 export const MAX_NEARBY_DELIVERY_CANDIDATES = 8;
 export const NEARBY_DELIVERY_RADIUS_METERS = 250;
 export const MAX_NEARBY_DELIVERY_DETOUR_MS = 3 * 60 * 1_000;
+
+export const SIMULATION_ALGORITHM_OPTIONS = [
+  {
+    id: "current-hybrid",
+    label: "Current hybrid (Google Routes) — Default",
+    description:
+      "Current street-based heuristic with Google route times and route geometry.",
+    status: "available",
+  },
+  {
+    id: "google-route-time-nearest-neighbor",
+    label: "Google route-time nearest neighbor",
+    description:
+      "Select exactly the target count and choose each next address by Google route time.",
+    status: "available",
+  },
+  {
+    id: "walkable-service-areas",
+    label: "Walkable service areas",
+    description:
+      "Group selected stops into walk loops up to a provisional 1 km actual-route limit, including adjacent streets.",
+    status: "available",
+  },
+  {
+    id: "service-areas-hierarchical-local-search",
+    label: "Service areas + local search",
+    description:
+      "Improve each service-area loop with bounded Google route-time 2-opt search; the 1 km limit is provisional.",
+    status: "available",
+  },
+  {
+    id: "ortools-vrp",
+    label: "OR-Tools / VRP — Future",
+    description:
+      "For future multi-worker, multi-vehicle, shift-time, or cross-area planning.",
+    status: "planned",
+  },
+] as const;
+
+export type SimulationAlgorithmId =
+  (typeof SIMULATION_ALGORITHM_OPTIONS)[number]["id"];
+
+export const DEFAULT_SIMULATION_ALGORITHM_ID: SimulationAlgorithmId = "current-hybrid";
+
+export function getSelectableSimulationAlgorithmId(
+  value: string,
+): SimulationAlgorithmId | null {
+  const option = SIMULATION_ALGORITHM_OPTIONS.find(({ id }) => id === value);
+  return option?.status === "available" ? option.id : null;
+}
 
 const MAX_ROUTE_INTERMEDIATES = 25;
 const MAX_ROUTE_EDGES = MAX_ROUTE_INTERMEDIATES + 1;
@@ -110,6 +173,26 @@ export function getSimulationPlanningPoints(
   );
 }
 
+export function getAvailableStartStreets(
+  points: MapAddressPoint[],
+  excludedAddressKeys: ReadonlySet<string> = new Set(),
+): string[] {
+  const streets = new Map<string, string>();
+  for (const point of points) {
+    const street = point.street?.trim();
+    if (
+      point.status !== "unsent" ||
+      excludedAddressKeys.has(point.addressKey) ||
+      !street
+    ) {
+      continue;
+    }
+    const normalized = normalizeAddressPart(street);
+    if (normalized && !streets.has(normalized)) streets.set(normalized, street);
+  }
+  return [...streets.values()].sort((left, right) => left.localeCompare(right));
+}
+
 export function isNorthShoreGeocodeResult(addressParts: string[]): boolean {
   const normalizedParts = addressParts.map(normalizeAddressPart);
 
@@ -123,6 +206,7 @@ export function buildStreetDeliveryPlan(
   points: MapAddressPoint[],
   requestedCount: number,
   excludedAddressKeys: ReadonlySet<string> = new Set(),
+  preferredStartStreet: string | null = null,
 ): StreetDeliveryPlan {
   if (!Number.isInteger(requestedCount) || requestedCount < 1 || requestedCount > MAX_SIMULATION_DELIVERIES) {
     throw new Error(`Choose between 1 and ${MAX_SIMULATION_DELIVERIES} addresses.`);
@@ -139,7 +223,12 @@ export function buildStreetDeliveryPlan(
     );
   }
 
-  const deliveries = selectNearestStreetFirst(start, unsentPoints, requestedCount);
+  const deliveries = selectNearestStreetFirst(
+    start,
+    unsentPoints,
+    requestedCount,
+    preferredStartStreet,
+  );
 
   return {
     start,
@@ -159,6 +248,7 @@ export function selectSimulationCycleBatches(
   deliveriesPerCycle: number,
   cycleCount: number,
   excludedAddressKeys: ReadonlySet<string> = new Set(),
+  preferredStartStreet: string | null = null,
 ): MapAddressPoint[][] {
   if (
     !Number.isInteger(deliveriesPerCycle) ||
@@ -183,12 +273,336 @@ export function selectSimulationCycleBatches(
     );
     if (!remaining.length) break;
     const count = Math.min(deliveriesPerCycle, remaining.length);
-    const batch = buildStreetDeliveryPlan(start, points, count, excluded).deliveries;
+    const batch = buildStreetDeliveryPlan(
+      start,
+      points,
+      count,
+      excluded,
+      cycle === 0 ? preferredStartStreet : null,
+    ).deliveries;
     if (!batch.length) break;
     batches.push(batch);
     for (const { addressKey } of batch) excluded.add(addressKey);
   }
   return batches;
+}
+
+export function selectSimulationAddressBatches(
+  start: SimulationLocation,
+  points: MapAddressPoint[],
+  deliveriesPerCycle: number,
+  cycleCount: number,
+  excludedAddressKeys: ReadonlySet<string> = new Set(),
+  preferredStartStreet: string | null = null,
+): MapAddressPoint[][] {
+  if (
+    !Number.isInteger(deliveriesPerCycle) ||
+    deliveriesPerCycle < 1 ||
+    deliveriesPerCycle > MAX_SIMULATION_DELIVERIES
+  ) {
+    throw new Error(`Choose between 1 and ${MAX_SIMULATION_DELIVERIES} addresses per run.`);
+  }
+  if (!Number.isInteger(cycleCount) || cycleCount < 1 || cycleCount > MAX_SIMULATION_CYCLES) {
+    throw new Error(`Choose between 1 and ${MAX_SIMULATION_CYCLES} runs.`);
+  }
+
+  const remaining = points
+    .filter(
+      ({ addressKey, status }) => status === "unsent" && !excludedAddressKeys.has(addressKey),
+    )
+    .sort((left, right) => compareDistanceFrom(start, left, right));
+  const batches: MapAddressPoint[][] = [];
+  for (let cycle = 0; cycle < cycleCount; cycle += 1) {
+    let batch: MapAddressPoint[];
+    if (cycle === 0 && preferredStartStreet) {
+      const preferredKey = normalizeAddressPart(preferredStartStreet);
+      const preferred = remaining.filter(
+        ({ street }) => street && normalizeAddressPart(street) === preferredKey,
+      );
+      preferred.sort((left, right) => compareDistanceFrom(start, left, right));
+      const preferredKeys = new Set(preferred.map(({ addressKey }) => addressKey));
+      const other = remaining.filter(({ addressKey }) => !preferredKeys.has(addressKey));
+      other.sort((left, right) => compareDistanceFrom(start, left, right));
+      batch = [...preferred, ...other].slice(0, deliveriesPerCycle);
+      const batchKeys = new Set(batch.map(({ addressKey }) => addressKey));
+      for (let index = remaining.length - 1; index >= 0; index -= 1) {
+        if (batchKeys.has(remaining[index]!.addressKey)) remaining.splice(index, 1);
+      }
+    } else {
+      batch = remaining.splice(0, deliveriesPerCycle);
+    }
+    if (!batch.length) break;
+    batches.push(batch);
+  }
+  return batches;
+}
+
+export async function orderDeliveriesByRouteTimeNearestNeighbor(
+  start: SimulationLocation,
+  deliveries: MapAddressPoint[],
+  lookupCosts: RouteCostLookup,
+  preferredStartStreet: string | null = null,
+): Promise<OrderedStreetDeliveries> {
+  return orderByRouteTime(start, deliveries, lookupCosts, preferredStartStreet);
+}
+
+export async function orderDeliveriesByWalkableServiceAreas(
+  start: SimulationLocation,
+  deliveries: MapAddressPoint[],
+  lookupCosts: RouteCostLookup,
+  useLocalSearch = false,
+  preferredStartStreet: string | null = null,
+): Promise<OrderedStreetDeliveries> {
+  if (!deliveries.length) return { deliveries: [], drivingStopAddressKeys: [] };
+
+  const remaining = [...deliveries];
+  const ordered: MapAddressPoint[] = [];
+  const drivingStopAddressKeys: string[] = [];
+  let carPosition = start;
+
+  while (remaining.length) {
+    const drivingCosts = await lookupCosts(
+      [carPosition],
+      remaining.map(locationOf),
+      "DRIVING",
+    );
+    validateRouteCostMatrix(drivingCosts, 1, remaining.length);
+    const preferredKey =
+      ordered.length === 0 && preferredStartStreet
+        ? normalizeAddressPart(preferredStartStreet)
+        : null;
+    const preferredStops = preferredKey
+      ? remaining.filter(
+          ({ street }) => street && normalizeAddressPart(street) === preferredKey,
+        )
+      : remaining;
+    const preferredCosts = preferredKey
+      ? preferredStops.map((point) =>
+          drivingCosts[0]![remaining.findIndex(({ addressKey }) => addressKey === point.addressKey)]!,
+        )
+      : drivingCosts[0]!;
+    const first = selectLowestCost(preferredStops, preferredCosts);
+    if (!first) {
+      throw new Error("Google Maps could not find a driving route to any remaining service area.");
+    }
+
+    if (ordered.length) drivingStopAddressKeys.push(first.point.addressKey);
+    const area = [first.point];
+    removePoint(remaining, first.point);
+    let walkingPosition = locationOf(first.point);
+    let areaDistanceMeters = 0;
+
+    while (remaining.length) {
+      const [walkingCosts, returnCosts] = await Promise.all([
+        lookupCosts(
+          [walkingPosition],
+          remaining.map(locationOf),
+          "WALKING",
+        ),
+        lookupCosts(
+          remaining.map(locationOf),
+          [locationOf(first.point)],
+          "WALKING",
+        ),
+      ]);
+      validateRouteCostMatrix(walkingCosts, 1, remaining.length);
+      validateRouteCostMatrix(returnCosts, remaining.length, 1);
+      const candidates = remaining.flatMap((point, index) => {
+        const onward = walkingCosts[0]![index];
+        const returnToParking = returnCosts[index]![0];
+        if (!onward || !returnToParking) return [];
+        const loopDistance =
+          areaDistanceMeters + onward.distanceMeters + returnToParking.distanceMeters;
+        if (loopDistance > MAX_WALK_SERVICE_AREA_DISTANCE_METERS) return [];
+        return [{ point, cost: onward, loopDistance }];
+      });
+      candidates.sort(
+        (left, right) =>
+          left.cost.durationMs - right.cost.durationMs ||
+          left.loopDistance - right.loopDistance ||
+          left.point.addressKey.localeCompare(right.point.addressKey),
+      );
+      const next = candidates[0];
+      if (!next) break;
+
+      area.push(next.point);
+      areaDistanceMeters += next.cost.distanceMeters;
+      walkingPosition = locationOf(next.point);
+      removePoint(remaining, next.point);
+    }
+
+    const orderedArea = useLocalSearch
+      ? await improveWalkableAreaOrder(area, lookupCosts)
+      : area;
+    ordered.push(...orderedArea);
+    carPosition = locationOf(first.point);
+  }
+
+  return { deliveries: ordered, drivingStopAddressKeys };
+}
+
+async function orderByRouteTime(
+  start: SimulationLocation,
+  deliveries: MapAddressPoint[],
+  lookupCosts: RouteCostLookup,
+  preferredStartStreet: string | null = null,
+): Promise<OrderedStreetDeliveries> {
+  const remaining = [...deliveries];
+  const ordered: MapAddressPoint[] = [];
+  const drivingStopAddressKeys: string[] = [];
+  let carPosition = start;
+  let current = start;
+
+  while (remaining.length) {
+    const mode: SimulationTravelMode = ordered.length ? "WALKING" : "DRIVING";
+    const preferredKey =
+      preferredStartStreet && remaining.some(
+        ({ street }) => street && normalizeAddressPart(street) === normalizeAddressPart(preferredStartStreet),
+      )
+        ? normalizeAddressPart(preferredStartStreet)
+        : null;
+    const candidates = preferredKey
+      ? remaining.filter(
+          ({ street }) => street && normalizeAddressPart(street) === preferredKey,
+        )
+      : remaining;
+    let costs = await lookupCosts([current], candidates.map(locationOf), mode);
+    validateRouteCostMatrix(costs, 1, candidates.length);
+    let next = selectLowestCost(candidates, costs[0]!, mode === "WALKING");
+    if (!next) {
+      costs = await lookupCosts(
+        [carPosition],
+        candidates.map(locationOf),
+        "DRIVING",
+      );
+      validateRouteCostMatrix(costs, 1, candidates.length);
+      next = selectLowestCost(candidates, costs[0]!);
+      if (!next) {
+        throw new Error("Google Maps could not find a driving route to any remaining address.");
+      }
+      if (ordered.length) drivingStopAddressKeys.push(next.point.addressKey);
+      carPosition = locationOf(next.point);
+    }
+
+    ordered.push(next.point);
+    removePoint(remaining, next.point);
+    current = locationOf(next.point);
+    if (ordered.length === 1) carPosition = current;
+  }
+
+  return { deliveries: ordered, drivingStopAddressKeys };
+}
+
+async function improveWalkableAreaOrder(
+  area: MapAddressPoint[],
+  lookupCosts: RouteCostLookup,
+): Promise<MapAddressPoint[]> {
+  if (area.length < 4) return area;
+
+  const locations = area.map(locationOf);
+  const matrix = await lookupCosts(locations, locations, "WALKING");
+  validateRouteCostMatrix(matrix, area.length, area.length);
+  const best = [...area];
+  let bestScore = scoreWalkLoop(best, area[0]!, area, matrix);
+  if (!bestScore) return area;
+
+  for (let pass = 0; pass < 8; pass += 1) {
+    let improved = false;
+    for (let left = 1; left < best.length - 1; left += 1) {
+      for (let right = left + 1; right < best.length; right += 1) {
+        const candidate = [
+          ...best.slice(0, left),
+          ...best.slice(left, right + 1).reverse(),
+          ...best.slice(right + 1),
+        ];
+        const score = scoreWalkLoop(candidate, area[0]!, area, matrix);
+        if (!score || compareRouteScores(score, bestScore) >= 0) continue;
+        best.splice(0, best.length, ...candidate);
+        bestScore = score;
+        improved = true;
+      }
+    }
+    if (!improved) break;
+  }
+
+  return best;
+}
+
+function scoreWalkLoop(
+  order: MapAddressPoint[],
+  parking: MapAddressPoint,
+  points: MapAddressPoint[],
+  costs: Array<Array<SimulationRouteCost | null>>,
+): SimulationRouteCost | null {
+  let durationMs = 0;
+  let distanceMeters = 0;
+  for (let index = 0; index < order.length; index += 1) {
+    const from = points.findIndex(({ addressKey }) => addressKey === order[index]!.addressKey);
+    const to = points.findIndex(
+      ({ addressKey }) => addressKey === order[(index + 1) % order.length]!.addressKey,
+    );
+    const cost = costs[from]?.[to];
+    if (!cost) return null;
+    durationMs += cost.durationMs;
+    distanceMeters += cost.distanceMeters;
+  }
+  if (order[0]?.addressKey !== parking.addressKey) return null;
+  if (distanceMeters > MAX_WALK_SERVICE_AREA_DISTANCE_METERS) return null;
+  return { durationMs, distanceMeters };
+}
+
+function compareRouteScores(
+  left: SimulationRouteCost,
+  right: SimulationRouteCost,
+): number {
+  return left.durationMs - right.durationMs || left.distanceMeters - right.distanceMeters;
+}
+
+function selectLowestCost(
+  points: MapAddressPoint[],
+  costs: Array<SimulationRouteCost | null>,
+  walkingOnly = false,
+): { point: MapAddressPoint; cost: SimulationRouteCost } | null {
+  const candidates = points.flatMap((point, index) => {
+    const cost = costs[index];
+    if (!cost || (walkingOnly && cost.durationMs > MAX_WALK_DURATION_MS)) return [];
+    return [{ point, cost }];
+  });
+  candidates.sort(
+    (left, right) =>
+      left.cost.durationMs - right.cost.durationMs ||
+      left.cost.distanceMeters - right.cost.distanceMeters ||
+      left.point.addressKey.localeCompare(right.point.addressKey),
+  );
+  return candidates[0] ?? null;
+}
+
+function validateRouteCostMatrix(
+  costs: Array<Array<SimulationRouteCost | null>>,
+  expectedRows: number,
+  expectedColumns: number,
+): void {
+  if (
+    costs.length !== expectedRows ||
+    costs.some((row) => row.length !== expectedColumns) ||
+    costs.some((row) =>
+      row.some(
+        (cost) =>
+          cost !== null &&
+          (!Number.isFinite(cost.durationMs) ||
+            cost.durationMs < 0 ||
+            !Number.isFinite(cost.distanceMeters) ||
+            cost.distanceMeters < 0),
+      ),
+    )
+  ) {
+    throw new Error("Google Maps returned incomplete or invalid route costs.");
+  }
+}
+
+function removePoint(points: MapAddressPoint[], selected: MapAddressPoint): void {
+  const index = points.findIndex(({ addressKey }) => addressKey === selected.addressKey);
+  if (index >= 0) points.splice(index, 1);
 }
 
 export function combineSimulationCyclePlans(
@@ -233,19 +647,31 @@ export async function orderStreetsByRouteTime(
   start: SimulationLocation,
   deliveries: MapAddressPoint[],
   lookupDurations: RouteDurationLookup,
+  preferredStartStreet: string | null = null,
 ): Promise<OrderedStreetDeliveries> {
   const remaining = groupDeliveriesByStreet(deliveries);
   const ordered: MapAddressPoint[] = [];
   const drivingStopAddressKeys: string[] = [];
   let current = start;
   let firstStreet = true;
+  const preferredStreetKey = preferredStartStreet
+    ? normalizeAddressPart(preferredStartStreet)
+    : null;
 
   while (remaining.length) {
     const remainingCandidates = remaining.map((group) => ({
       group,
       entry: orderStreetPoints(current, group.points)[0]!,
     }));
-    const candidates = firstStreet ? remainingCandidates.slice(0, 1) : remainingCandidates;
+    const preferredCandidate =
+      firstStreet && preferredStreetKey
+        ? remainingCandidates.find(({ group }) => group.key === preferredStreetKey)
+        : null;
+    const candidates = preferredCandidate
+      ? [preferredCandidate]
+      : firstStreet
+        ? remainingCandidates.slice(0, 1)
+        : remainingCandidates;
     const destinations = candidates.map(({ entry }) => locationOf(entry));
     let selectedMode: SimulationTravelMode = firstStreet ? "DRIVING" : "WALKING";
     let durations = await lookupDurations(current, destinations, selectedMode);
@@ -334,6 +760,7 @@ export function getWalkReturnRequests(
   deliveries: MapAddressPoint[],
   walkingLegs: Array<SimulationRouteLeg | null>,
   drivingStopAddressKeys: ReadonlySet<string> = new Set(),
+  maxWalkDurationMs = MAX_WALK_DURATION_MS,
 ): WalkReturnRequest[] {
   const requests: WalkReturnRequest[] = [];
   let parking = locationOf(deliveries[0]!);
@@ -345,7 +772,7 @@ export function getWalkReturnRequests(
     const shouldDrive =
       drivingStopAddressKeys.has(nextDelivery.addressKey) ||
       (walkingLeg !== null && walkingLeg !== undefined &&
-        walkingLeg.durationMs > MAX_WALK_DURATION_MS);
+        walkingLeg.durationMs > maxWalkDurationMs);
 
     if (shouldDrive) {
       if (hasWalkedSinceParking) {
@@ -532,6 +959,7 @@ export function buildDeliverySimulationPlan(
   longDriveLegs: Map<number, SimulationRouteLeg>,
   walkReturnLegs: Map<number, SimulationRouteLeg>,
   driveHome: SimulationRouteLeg,
+  maxWalkDurationMs = MAX_WALK_DURATION_MS,
 ): StreetDeliveryPlan {
   if (walkingLegs.length !== plan.deliveries.length - 1) {
     throw new Error("Google Maps returned an incomplete walking route for the selected addresses.");
@@ -565,7 +993,7 @@ export function buildDeliverySimulationPlan(
     const shouldDrive =
       plan.drivingStopAddressKeys.includes(nextDelivery.addressKey) ||
       (walkingLeg !== null && walkingLeg !== undefined &&
-        walkingLeg.durationMs > MAX_WALK_DURATION_MS);
+        walkingLeg.durationMs > maxWalkDurationMs);
 
     if (!shouldDrive) {
       if (!walkingLeg) {
@@ -833,17 +1261,27 @@ function selectNearestStreetFirst(
   start: SimulationLocation,
   points: MapAddressPoint[],
   requestedCount: number,
+  preferredStartStreet: string | null,
 ): MapAddressPoint[] {
   const streetGroups = groupDeliveriesByStreet(points);
-  const firstGroupIndex = streetGroups.reduce(
-    (nearestIndex, group, index) =>
-      distanceToNearestPoint(start, group.points) <
-      distanceToNearestPoint(start, streetGroups[nearestIndex]!.points)
-        ? index
-        : nearestIndex,
-    0,
-  );
-  const firstGroup = streetGroups.splice(firstGroupIndex, 1)[0]!;
+  const preferredKey = preferredStartStreet
+    ? normalizeAddressPart(preferredStartStreet)
+    : null;
+  const firstGroupIndex = preferredKey
+    ? streetGroups.findIndex(({ key }) => key === preferredKey)
+    : -1;
+  const selectedFirstGroupIndex =
+    firstGroupIndex >= 0
+      ? firstGroupIndex
+      : streetGroups.reduce(
+          (nearestIndex, group, index) =>
+            distanceToNearestPoint(start, group.points) <
+            distanceToNearestPoint(start, streetGroups[nearestIndex]!.points)
+              ? index
+              : nearestIndex,
+          0,
+        );
+  const firstGroup = streetGroups.splice(selectedFirstGroupIndex, 1)[0]!;
   const firstStreetRoute = orderStreetPoints(start, firstGroup.points);
   const firstStop = locationOf(firstStreetRoute[0]!);
   const nearbyGroups = new Set(
@@ -961,6 +1399,17 @@ function distanceToNearestPoint(
   points: MapAddressPoint[],
 ): number {
   return Math.min(...points.map((point) => distanceMeters(from, point)));
+}
+
+function compareDistanceFrom(
+  start: SimulationLocation,
+  left: MapAddressPoint,
+  right: MapAddressPoint,
+): number {
+  return (
+    distanceMeters(start, left) - distanceMeters(start, right) ||
+    left.addressKey.localeCompare(right.addressKey)
+  );
 }
 
 function makeRouteStep(

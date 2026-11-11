@@ -8,6 +8,7 @@ import {
   chooseNearbyDeliveryCandidate,
   getNearbyDeliveryCandidates,
   getSimulationPlanningPoints,
+  getAvailableStartStreets,
   combineSimulationCyclePlans,
   getPathHeading,
   getSimulationDuration,
@@ -24,8 +25,15 @@ import {
   MAX_SIMULATION_CYCLES,
   NEARBY_DELIVERY_RADIUS_METERS,
   MAX_WALK_DURATION_MS,
+  MAX_WALK_SERVICE_AREA_DISTANCE_METERS,
+  orderDeliveriesByRouteTimeNearestNeighbor,
+  orderDeliveriesByWalkableServiceAreas,
   orderStreetsByRouteTime,
+  DEFAULT_SIMULATION_ALGORITHM_ID,
+  getSelectableSimulationAlgorithmId,
+  SIMULATION_ALGORITHM_OPTIONS,
   selectSimulationCycleBatches,
+  selectSimulationAddressBatches,
   SIMULATION_CYCLE_DELAY_MS,
   type SimulationLocation,
   type SimulationRouteLeg,
@@ -338,6 +346,325 @@ test("includes Junk mail as an unsent simulation candidate only when its status 
   assert.equal(points[1]?.status, "junk");
 });
 
+test("exposes implemented algorithms and keeps future strategies unselectable", () => {
+  assert.equal(DEFAULT_SIMULATION_ALGORITHM_ID, "current-hybrid");
+  assert.equal(getSelectableSimulationAlgorithmId(DEFAULT_SIMULATION_ALGORITHM_ID), "current-hybrid");
+  assert.equal(
+    SIMULATION_ALGORITHM_OPTIONS.filter(({ status }) => status === "available").length,
+    4,
+  );
+  assert.ok(
+    SIMULATION_ALGORITHM_OPTIONS
+      .filter(({ status }) => status === "planned")
+      .every(({ id }) => getSelectableSimulationAlgorithmId(id) === null),
+  );
+  assert.equal(getSelectableSimulationAlgorithmId("unknown-algorithm"), null);
+});
+
+test("selects exact-sized batches for non-hybrid algorithms", () => {
+  const points = [
+    point("Far", 0.003, 0, "unsent", "far"),
+    point("Near", 0.001, 0, "unsent", "near"),
+    point("Sent", 0, 0, "sent", "sent"),
+  ];
+
+  assert.deepEqual(
+    selectSimulationAddressBatches({ lat: 0, lng: 0 }, points, 1, 2).map((batch) =>
+      batch.map(({ addressKey }) => addressKey),
+    ),
+    [["near"], ["far"]],
+  );
+});
+
+test("lists only unique streets with eligible unsent addresses", () => {
+  const points = [
+    { ...point("A", 0.001, 0, "unsent", "a"), street: "Birch Road" },
+    { ...point("B", 0.002, 0, "unsent", "b"), street: "birch road" },
+    { ...point("Sent", 0.003, 0, "sent", "sent"), street: "Cedar Street" },
+    { ...point("Junk", 0.004, 0, "junk", "junk"), street: "Dune Place" },
+    { ...point("Excluded", 0.005, 0, "unsent", "excluded"), street: "Elm Lane" },
+    { ...point("No street", 0.006, 0, "unsent", "no-street"), street: null },
+  ];
+
+  assert.deepEqual(getAvailableStartStreets(points), ["Birch Road", "Elm Lane"]);
+  assert.deepEqual(
+    getAvailableStartStreets(points, new Set(["excluded"])),
+    ["Birch Road"],
+  );
+});
+
+test("prioritizes the selected street in the first hybrid batch only", () => {
+  const points = [
+    { ...point("Near", 0.001, 0, "unsent", "near"), street: "Near Street" },
+    { ...point("Chosen 1", 0.01, 0, "unsent", "chosen-1"), street: "Chosen Road" },
+    { ...point("Chosen 2", 0.011, 0, "unsent", "chosen-2"), street: "Chosen Road" },
+    { ...point("Next", 0.012, 0, "unsent", "next"), street: "Next Avenue" },
+  ];
+
+  const batches = selectSimulationCycleBatches(
+    { lat: 0, lng: 0 },
+    points,
+    1,
+    2,
+    new Set(),
+    "Chosen Road",
+  );
+
+  assert.deepEqual(
+    batches.map((batch) => batch.map(({ addressKey }) => addressKey)),
+    [["chosen-1", "chosen-2", "next"], ["near"]],
+  );
+});
+
+test("prioritizes selected-street addresses when selecting exact-sized batches", () => {
+  const points = [
+    { ...point("Near", 0.001, 0, "unsent", "near"), street: "Near Street" },
+    { ...point("Selected 1", 0.01, 0, "unsent", "selected-1"), street: "Chosen Road" },
+    { ...point("Selected 2", 0.011, 0, "unsent", "selected-2"), street: "Chosen Road" },
+    { ...point("Far", 0.02, 0, "unsent", "far"), street: "Far Place" },
+  ];
+
+  const batches = selectSimulationAddressBatches(
+    { lat: 0, lng: 0 },
+    points,
+    2,
+    2,
+    new Set(),
+    "Chosen Road",
+  );
+
+  assert.deepEqual(
+    batches.map((batch) => batch.map(({ addressKey }) => addressKey)),
+    [["selected-1", "selected-2"], ["near", "far"]],
+  );
+});
+
+test("route-time nearest neighbor uses Google route duration rather than point distance", async () => {
+  const points = [
+    point("Geographically close", 1, 0, "unsent", "close"),
+    point("Fast route", 2, 0, "unsent", "fast"),
+  ];
+  const ordered = await orderDeliveriesByRouteTimeNearestNeighbor(
+    { lat: 0, lng: 0 },
+    points,
+    async (origins, destinations) =>
+      origins.map((origin) =>
+        destinations.map((destination) => ({
+          durationMs: destination.lat === 1 ? 60_000 : 10_000,
+          distanceMeters: Math.abs(destination.lat - origin.lat) * 100,
+        })),
+      ),
+  );
+
+  assert.deepEqual(
+    ordered.deliveries.map(({ addressKey }) => addressKey),
+    ["fast", "close"],
+  );
+});
+
+test("route-time nearest neighbor completes the selected street before other streets", async () => {
+  const points = [
+    { ...point("Close other", 0.001, 0, "unsent", "other"), street: "Other Street" },
+    { ...point("Chosen 1", 0.01, 0, "unsent", "chosen-1"), street: "Chosen Road" },
+    { ...point("Chosen 2", 0.011, 0, "unsent", "chosen-2"), street: "Chosen Road" },
+  ];
+  const ordered = await orderDeliveriesByRouteTimeNearestNeighbor(
+    { lat: 0, lng: 0 },
+    points,
+    async (origins, destinations) =>
+      origins.map((origin) =>
+        destinations.map((destination) => ({
+          durationMs: Math.abs(destination.lat - origin.lat) * 1_000,
+          distanceMeters: Math.abs(destination.lat - origin.lat) * 100,
+        })),
+      ),
+    "Chosen Road",
+  );
+
+  assert.deepEqual(
+    ordered.deliveries.map(({ addressKey }) => addressKey),
+    ["chosen-1", "chosen-2", "other"],
+  );
+});
+
+test("route-time nearest neighbor drives from the last parked address after a walk fallback", async () => {
+  const points = [
+    point("First", 1, 0, "unsent", "first"),
+    point("Second", 2, 0, "unsent", "second"),
+    point("Third", 3, 0, "unsent", "third"),
+  ];
+  const drivingOrigins: number[] = [];
+  await orderDeliveriesByRouteTimeNearestNeighbor(
+    { lat: 0, lng: 0 },
+    points,
+    async (origins, destinations, mode) => {
+      if (mode === "DRIVING") drivingOrigins.push(origins[0]!.lat);
+      return origins.map((origin) =>
+        destinations.map((destination) =>
+          mode === "WALKING"
+            ? null
+            : {
+                durationMs: Math.abs(destination.lat - origin.lat) * 1_000,
+                distanceMeters: Math.abs(destination.lat - origin.lat) * 100,
+              },
+        ),
+      );
+    },
+  );
+
+  assert.deepEqual(drivingOrigins, [0, 1, 2]);
+});
+
+test("walkable service areas group stops within the actual-route 1 km round trip", async () => {
+  const points = [
+    point("First", 1, 0, "unsent", "first"),
+    point("Nearby", 2, 0, "unsent", "nearby"),
+    point("Separate area", 20, 0, "unsent", "separate"),
+  ];
+  const ordered = await orderDeliveriesByWalkableServiceAreas(
+    { lat: 0, lng: 0 },
+    points,
+    async (origins, destinations, mode) =>
+      origins.map((origin) =>
+        destinations.map((destination) => {
+          const distanceMeters =
+            mode === "WALKING"
+              ? Math.abs(destination.lat - origin.lat) * 100
+              : Math.abs(destination.lat - origin.lat) * 1_000;
+          return {
+            durationMs: distanceMeters * 100,
+            distanceMeters,
+          };
+        }),
+      ),
+  );
+
+  assert.equal(MAX_WALK_SERVICE_AREA_DISTANCE_METERS, 1_000);
+  assert.deepEqual(
+    ordered.deliveries.map(({ addressKey }) => addressKey),
+    ["first", "nearby", "separate"],
+  );
+  assert.deepEqual(ordered.drivingStopAddressKeys, ["separate"]);
+});
+
+test("walkable service areas seed the first parking point on the selected street", async () => {
+  const points = [
+    { ...point("Nearest", 1, 0, "unsent", "nearest"), street: "Nearest Street" },
+    { ...point("Selected", 10, 0, "unsent", "selected"), street: "Chosen Road" },
+  ];
+  const ordered = await orderDeliveriesByWalkableServiceAreas(
+    { lat: 0, lng: 0 },
+    points,
+    async (origins, destinations, mode) =>
+      origins.map((origin) =>
+        destinations.map((destination) => ({
+          durationMs:
+            Math.abs(destination.lat - origin.lat) * (mode === "DRIVING" ? 1_000 : 100),
+          distanceMeters: Math.abs(destination.lat - origin.lat) * 10,
+        })),
+      ),
+    false,
+    "Chosen Road",
+  );
+
+  assert.equal(ordered.deliveries[0]?.addressKey, "selected");
+});
+
+test("service-area local search improves the greedy walking order within its hard distance limit", async () => {
+  const points = [
+    point("A", 1, 0, "unsent", "a"),
+    point("B", 2, 0, "unsent", "b"),
+    point("C", 3, 0, "unsent", "c"),
+    point("D", 4, 0, "unsent", "d"),
+  ];
+  const lookupCosts = async (
+    origins: SimulationLocation[],
+    destinations: SimulationLocation[],
+    mode: "WALKING" | "DRIVING",
+  ) =>
+    origins.map((origin) =>
+      destinations.map((destination) => {
+        const from = Math.round(origin.lat);
+        const to = Math.round(destination.lat);
+        let durationMs = Math.abs(to - from) * 1_000;
+        if (mode === "WALKING") {
+          durationMs =
+            from === 1 && to === 2 ? 1 :
+            from === 1 && to === 3 ? 2 :
+            from === 2 && to === 3 ? 1 :
+            from === 3 && to === 2 ? 1 :
+            from === 2 && to === 4 ? 3 :
+            from === 3 && to === 4 ? 10 :
+            from === 4 && to === 1 ? 1 :
+            50;
+        }
+        return { durationMs, distanceMeters: 10 };
+      }),
+    );
+  const greedy = await orderDeliveriesByWalkableServiceAreas(
+    { lat: 0, lng: 0 },
+    points,
+    lookupCosts,
+  );
+  const improved = await orderDeliveriesByWalkableServiceAreas(
+    { lat: 0, lng: 0 },
+    points,
+    lookupCosts,
+    true,
+  );
+
+  assert.deepEqual(
+    greedy.deliveries.map(({ addressKey }) => addressKey),
+    ["a", "b", "c", "d"],
+  );
+  assert.deepEqual(
+    improved.deliveries.map(({ addressKey }) => addressKey),
+    ["a", "c", "b", "d"],
+  );
+  assert.ok(MAX_WALK_SERVICE_AREA_DISTANCE_METERS >= 4 * 10);
+});
+
+test("service-area plans keep long walk routes on foot and return to marked parking", () => {
+  const start = { lat: 0, lng: 0 };
+  const first = point("First", 1, 0, "unsent", "first");
+  const nearby = point("Nearby", 2, 0, "unsent", "nearby");
+  const separate = point("Separate area", 20, 0, "unsent", "separate");
+  const deliveries = [first, nearby, separate];
+  const walkingLegs = [
+    routeLeg(first, nearby, MAX_WALK_DURATION_MS + 1, 200),
+    routeLeg(nearby, separate, MAX_WALK_DURATION_MS + 1, 200),
+  ];
+  const walkReturns = getWalkReturnRequests(
+    deliveries,
+    walkingLegs,
+    new Set(["separate"]),
+    Number.POSITIVE_INFINITY,
+  );
+  const plan = buildDeliverySimulationPlan(
+    {
+      start,
+      deliveries,
+      drivingStopAddressKeys: ["separate"],
+      drivingPaths: [],
+      walkingPaths: [],
+      returnDrivePath: [],
+      totalDistanceMeters: 0,
+      steps: [],
+    },
+    routeLeg(start, first),
+    walkingLegs,
+    new Map([[1, routeLeg(nearby, separate, 60_000, 10_000)]]),
+    new Map([[1, routeLeg(nearby, first, 60_000, 200)]]),
+    routeLeg(separate, start),
+    Number.POSITIVE_INFINITY,
+  );
+
+  assert.equal(walkReturns.length, 1);
+  assert.equal(walkReturns[0]?.afterDeliveryIndex, 1);
+  assert.ok(plan.steps.some((step) => step.kind === "walk" && step.durationMs > MAX_WALK_DURATION_MS));
+  assert.ok(plan.steps.some((step) => step.kind === "drive" && step.addressKey === "separate"));
+});
+
 test("combines routed runs with a ten-second pause at the starting point", () => {
   const first = makeRoutedPlan().plan;
   const secondBase = buildStreetDeliveryPlan(
@@ -523,6 +850,24 @@ test("keeps the selected nearest first street and orders later streets by route 
   );
   assert.deepEqual(ordered.drivingStopAddressKeys, ["b"]);
   assert.deepEqual(calls, ["DRIVING:1", "WALKING:2", "WALKING:1", "DRIVING:1"]);
+});
+
+test("starts hybrid route ordering at the selected street", async () => {
+  const points = [
+    { ...point("Near", 0.001, 0, "unsent", "near"), street: "Near Street" },
+    { ...point("Chosen", 0.01, 0, "unsent", "chosen"), street: "Chosen Road" },
+  ];
+  const ordered = await orderStreetsByRouteTime(
+    { lat: 0, lng: 0 },
+    points,
+    async () => [1_000],
+    "Chosen Road",
+  );
+
+  assert.deepEqual(
+    ordered.deliveries.map(({ addressKey }) => addressKey),
+    ["chosen", "near"],
+  );
 });
 
 test("uses stable address keys when multiple delivery records share the same label", () => {

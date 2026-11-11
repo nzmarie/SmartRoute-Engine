@@ -626,11 +626,25 @@ a {
 }
 
 .simulation-form {
+  display: grid;
+  gap: 10px;
+}
+
+.simulation-control-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.simulation-primary-controls {
   align-items: flex-end;
 }
 
 .simulation-start-control,
+.simulation-start-street-control,
 .simulation-speed-control,
+.simulation-algorithm-control,
 .simulation-checkbox-control {
   display: grid;
   color: #526179;
@@ -645,9 +659,18 @@ a {
   flex: 0 1 420px;
 }
 
+.simulation-start-street-control {
+  display: grid;
+  width: min(26vw, 300px);
+  min-width: 200px;
+  flex: 0 1 300px;
+}
+
 .simulation-start-control input,
+.simulation-start-street-control select,
 .simulation-speed-control select,
-.simulation-speed-control input {
+.simulation-speed-control input,
+.simulation-algorithm-control select {
   min-height: 38px;
   padding: 8px 10px;
   border: 1px solid #d5deea;
@@ -660,6 +683,16 @@ a {
 .simulation-speed-control select,
 .simulation-speed-control input {
   min-width: 76px;
+}
+
+.simulation-start-street-control select {
+  min-width: 0;
+  width: 100%;
+}
+
+.simulation-algorithm-control select {
+  width: 220px;
+  max-width: 24vw;
 }
 
 .simulation-checkbox-control {
@@ -1227,8 +1260,23 @@ a {
     flex-basis: 100%;
   }
 
+  .simulation-start-street-control {
+    min-width: 100%;
+    width: 100%;
+    flex-basis: 100%;
+  }
+
   .simulation-speed-control {
     flex: 1;
+  }
+
+  .simulation-algorithm-control {
+    flex: 1;
+  }
+
+  .simulation-algorithm-control select {
+    width: 100%;
+    max-width: none;
   }
 
   .simulation-details {

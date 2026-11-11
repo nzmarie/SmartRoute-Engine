@@ -24,12 +24,18 @@ import {
   buildStreetDeliveryPlan,
   chooseNearbyDeliveryCandidate,
   combineSimulationCyclePlans,
+  DEFAULT_SIMULATION_ALGORITHM_ID,
+  getAvailableStartStreets,
   getNearbyDeliveryCandidates,
   getWalkReturnRequests,
   getWalkingRouteChunks,
   getSimulationDuration,
   getSimulationFrame,
   getSimulationPlanningPoints,
+  getSelectableSimulationAlgorithmId,
+  orderDeliveriesByRouteTimeNearestNeighbor,
+  orderDeliveriesByWalkableServiceAreas,
+  selectSimulationAddressBatches,
   insertNearbyDeliveryIntoPlan,
   isNorthShoreGeocodeResult,
   MAX_NEARBY_DELIVERY_ADDITIONS,
@@ -37,10 +43,13 @@ import {
   MAX_SIMULATION_DELIVERIES,
   MAX_WALK_DURATION_MS,
   orderStreetsByRouteTime,
+  SIMULATION_ALGORITHM_OPTIONS,
   selectSimulationCycleBatches,
   SIMULATION_CYCLE_DELAY_MS,
   type SimulationFrame,
+  type RouteCostLookup,
   type SimulationRouteLeg,
+  type SimulationAlgorithmId,
   type StreetDeliveryPlan,
 } from "@/lib/delivery-simulation";
 import type { MapAddressPoint } from "@/lib/map-data";
@@ -228,11 +237,15 @@ function SimulationControls({
   const routesLibrary = useMapsLibrary("routes");
   const map = useMap();
   const [startAddress, setStartAddress] = useState("");
+  const [startStreet, setStartStreet] = useState("");
   const [speed, setSpeed] = useState(50);
   const [deliveryCount, setDeliveryCount] = useState("50");
   const [cycleCount, setCycleCount] = useState("1");
   const [junkStatusUnknown, setJunkStatusUnknown] = useState(false);
   const [showRoute, setShowRoute] = useState(true);
+  const [algorithmId, setAlgorithmId] = useState<SimulationAlgorithmId>(
+    DEFAULT_SIMULATION_ALGORITHM_ID,
+  );
   const [playbackState, setPlaybackState] = useState<PlaybackState>("idle");
   const [plan, setPlan] = useState<StreetDeliveryPlan | null>(null);
   const [plannedCycleCount, setPlannedCycleCount] = useState(0);
@@ -258,8 +271,18 @@ function SimulationControls({
   const eligibleAddressCount = planningPoints.filter(
     ({ addressKey, status }) => status === "unsent" && !simulatedAddressKeys.has(addressKey),
   ).length;
+  const availableStartStreets = useMemo(
+    () => getAvailableStartStreets(planningPoints, simulatedAddressKeys),
+    [planningPoints, simulatedAddressKeys],
+  );
+  const selectedStartStreet = availableStartStreets.find(
+    (street) => street.toLocaleLowerCase() === startStreet.toLocaleLowerCase(),
+  ) ?? null;
   const maxDeliveries = Math.min(MAX_SIMULATION_DELIVERIES, eligibleAddressCount);
   const eligibleAddressLabel = junkStatusUnknown ? "Unsent or unknown Junk mail" : "Unsent";
+  const selectedAlgorithm = SIMULATION_ALGORITHM_OPTIONS.find(
+    ({ id }) => id === algorithmId,
+  )!;
   const parsedDeliveryCount = Number(deliveryCount);
   const normalizedDeliveryCount =
     maxDeliveries === 0 || !deliveryCount.trim()
@@ -315,6 +338,7 @@ function SimulationControls({
     if (
       playbackState !== "playing" ||
       !plan ||
+      plan.supportsNearbyDeliveryInsertion === false ||
       (frame?.kind !== "walk" && frame?.kind !== "walk-return") ||
       deliveredCount === 0 ||
       deliveredCount > plan.deliveries.length ||
@@ -528,6 +552,10 @@ function SimulationControls({
   async function startSimulation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!isLoaded || !geocodingLibrary || !routesLibrary || !startAddress.trim()) return;
+    if (getSelectableSimulationAlgorithmId(algorithmId) === null) {
+      setError("Choose an implemented planning algorithm.");
+      return;
+    }
 
     setError(null);
     nearbyScanGenerationRef.current += 1;
@@ -568,56 +596,155 @@ function SimulationControls({
         throw new Error(`Choose between 1 and ${MAX_SIMULATION_CYCLES} runs.`);
       }
 
-      const cycleBatches = selectSimulationCycleBatches(
-        start,
-        planningPoints,
-        requestedCount,
-        parsedCycleCount,
-        simulatedAddressKeys,
-      );
+      const isCurrentHybrid = algorithmId === "current-hybrid";
+      const usesServiceAreas =
+        algorithmId === "walkable-service-areas" ||
+        algorithmId === "service-areas-hierarchical-local-search";
+      const cycleBatches = isCurrentHybrid
+        ? selectSimulationCycleBatches(
+            start,
+            planningPoints,
+            requestedCount,
+            parsedCycleCount,
+            simulatedAddressKeys,
+            selectedStartStreet,
+          )
+        : selectSimulationAddressBatches(
+            start,
+            planningPoints,
+            requestedCount,
+            parsedCycleCount,
+            simulatedAddressKeys,
+            selectedStartStreet,
+          );
       if (!cycleBatches.length) {
         throw new Error("No mapped eligible addresses remain for this simulation.");
       }
 
+      const routeCostLookup: RouteCostLookup = async (
+        origins,
+        destinations,
+        travelMode,
+      ) => {
+        const costs: Array<Array<{ durationMs: number; distanceMeters: number } | null>> =
+          Array.from({ length: origins.length }, () => Array(destinations.length).fill(null));
+        const matrixLimit = 25;
+        for (let originOffset = 0; originOffset < origins.length; originOffset += matrixLimit) {
+          const originChunk = origins.slice(originOffset, originOffset + matrixLimit);
+          for (
+            let destinationOffset = 0;
+            destinationOffset < destinations.length;
+            destinationOffset += matrixLimit
+          ) {
+            const destinationChunk = destinations.slice(
+              destinationOffset,
+              destinationOffset + matrixLimit,
+            );
+            const { matrix } = await routesLibrary.RouteMatrix.computeRouteMatrix({
+              origins: originChunk,
+              destinations: destinationChunk,
+              travelMode,
+              fields: ["condition", "durationMillis", "distanceMeters"],
+            });
+            const rows: Array<{
+              items: Array<{
+                condition?: string | null;
+                durationMillis?: number | null;
+                distanceMeters?: number | null;
+              }>;
+            }> = matrix.rows;
+            if (
+              rows.length !== originChunk.length ||
+              rows.some((row) => row.items.length !== destinationChunk.length)
+            ) {
+              throw new Error("Google Maps returned an incomplete route cost matrix.");
+            }
+            for (let rowIndex = 0; rowIndex < originChunk.length; rowIndex += 1) {
+              for (let columnIndex = 0; columnIndex < destinationChunk.length; columnIndex += 1) {
+                const item = rows[rowIndex]!.items[columnIndex]!;
+                if (item.condition !== "ROUTE_EXISTS") continue;
+                const durationMs = item.durationMillis;
+                const distanceMeters = item.distanceMeters;
+                if (
+                  typeof durationMs !== "number" ||
+                  !Number.isFinite(durationMs) ||
+                  durationMs < 0 ||
+                  typeof distanceMeters !== "number" ||
+                  !Number.isFinite(distanceMeters) ||
+                  distanceMeters < 0
+                ) {
+                  throw new Error("Google Maps returned an invalid route duration or distance.");
+                }
+                costs[originOffset + rowIndex]![destinationOffset + columnIndex] = {
+                  durationMs,
+                  distanceMeters,
+                };
+              }
+            }
+          }
+        }
+        return costs;
+      };
+
       const routedCycles: StreetDeliveryPlan[] = [];
-      for (const batch of cycleBatches) {
+      for (const [cycleIndex, batch] of cycleBatches.entries()) {
+        const cycleStartStreet = cycleIndex === 0 ? selectedStartStreet : null;
         const selectedPlan: StreetDeliveryPlan = {
           start,
           deliveries: batch,
           drivingStopAddressKeys: [],
+          supportsNearbyDeliveryInsertion: !usesServiceAreas,
           drivingPaths: [],
           walkingPaths: [],
           returnDrivePath: [],
           totalDistanceMeters: 0,
           steps: [],
         };
-        const streetOrder = await orderStreetsByRouteTime(
-          start,
-          selectedPlan.deliveries,
-          async (origin, destinations, travelMode) => {
-            const { matrix } = await routesLibrary.RouteMatrix.computeRouteMatrix({
-              origins: [origin],
-              destinations,
-              travelMode,
-              fields: ["condition", "durationMillis"],
-            });
-            const items = matrix.rows[0]?.items ?? [];
-            if (items.length !== destinations.length) {
-              throw new Error("Google Maps returned incomplete street route durations.");
-            }
-            return items.map(
-              (item: {
-                condition?: string | null;
-                durationMillis?: number | null;
-              }) =>
-              item.condition === "ROUTE_EXISTS" ? item.durationMillis ?? null : null,
-            );
-          },
-        );
+        const orderedDeliveries = isCurrentHybrid
+          ? await orderStreetsByRouteTime(
+              start,
+              selectedPlan.deliveries,
+              async (origin, destinations, travelMode) => {
+                const { matrix } = await routesLibrary.RouteMatrix.computeRouteMatrix({
+                  origins: [origin],
+                  destinations,
+                  travelMode,
+                  fields: ["condition", "durationMillis"],
+                });
+                const items = matrix.rows[0]?.items ?? [];
+                if (items.length !== destinations.length) {
+                  throw new Error("Google Maps returned incomplete street route durations.");
+                }
+                return items.map(
+                  (item: {
+                    condition?: string | null;
+                    durationMillis?: number | null;
+                  }) =>
+                    item.condition === "ROUTE_EXISTS"
+                      ? item.durationMillis ?? null
+                      : null,
+                );
+              },
+              cycleStartStreet,
+            )
+          : usesServiceAreas
+            ? await orderDeliveriesByWalkableServiceAreas(
+                start,
+                selectedPlan.deliveries,
+                routeCostLookup,
+                algorithmId === "service-areas-hierarchical-local-search",
+                cycleStartStreet,
+              )
+            : await orderDeliveriesByRouteTimeNearestNeighbor(
+                start,
+                selectedPlan.deliveries,
+                routeCostLookup,
+                cycleStartStreet,
+              );
         const deliveryPlan = {
           ...selectedPlan,
-          deliveries: streetOrder.deliveries,
-          drivingStopAddressKeys: streetOrder.drivingStopAddressKeys,
+          deliveries: orderedDeliveries.deliveries,
+          drivingStopAddressKeys: orderedDeliveries.drivingStopAddressKeys,
         };
         const firstDelivery = deliveryPlan.deliveries[0]!;
         const driveOutResult = await routesLibrary.Route.computeRoutes({
@@ -668,7 +795,7 @@ function SimulationControls({
           const walkingLeg = walkingLegs[index];
           if (
             !drivingStopAddressKeys.has(nextDelivery.addressKey) &&
-            (!walkingLeg || walkingLeg.durationMs <= MAX_WALK_DURATION_MS)
+            (usesServiceAreas || !walkingLeg || walkingLeg.durationMs <= MAX_WALK_DURATION_MS)
           ) {
             continue;
           }
@@ -692,6 +819,7 @@ function SimulationControls({
           deliveryPlan.deliveries,
           walkingLegs,
           drivingStopAddressKeys,
+          usesServiceAreas ? Number.POSITIVE_INFINITY : MAX_WALK_DURATION_MS,
         )) {
           const returnResult = await routesLibrary.Route.computeRoutes({
             origin: request.origin,
@@ -726,6 +854,7 @@ function SimulationControls({
             longDriveLegs,
             walkReturnLegs,
             driveHomeLeg,
+            usesServiceAreas ? Number.POSITIVE_INFINITY : MAX_WALK_DURATION_MS,
           ),
         );
       }
@@ -807,115 +936,162 @@ function SimulationControls({
           <span className="simulation-badge">Demo only · no delivery data is changed</span>
         </div>
         <form className="simulation-form" onSubmit={(event) => void startSimulation(event)}>
-          <label className="simulation-start-control">
-            <span>Start address</span>
-            <input
-              value={startAddress}
-              onChange={(event) => setStartAddress(event.target.value)}
-              placeholder="e.g. 10 Tawa Drive, Albany, Auckland"
-              autoComplete="street-address"
-              required
-              disabled={playbackState === "preparing"}
-            />
-          </label>
-          <label className="simulation-speed-control">
-            <span>Runs (max {MAX_SIMULATION_CYCLES})</span>
-            <input
-              type="number"
-              min={1}
-              max={MAX_SIMULATION_CYCLES}
-              value={cycleCount}
-              onChange={(event) => setCycleCount(event.target.value)}
-              disabled={["preparing", "playing", "paused"].includes(playbackState)}
-              required
-            />
-          </label>
-          <label className="simulation-speed-control">
-            <span>Target per run (max {maxDeliveries})</span>
-            <input
-              type="number"
-              min={1}
-              max={maxDeliveries}
-              value={normalizedDeliveryCount}
-              onChange={(event) => setDeliveryCount(event.target.value)}
-              disabled={["preparing", "playing", "paused"].includes(playbackState) || maxDeliveries === 0}
-              required
-            />
-          </label>
-          <label className="simulation-speed-control">
-            <span>Speed</span>
-            <select
-              value={speed}
-              onChange={(event) => setSpeed(Number(event.target.value))}
-              disabled={playbackState === "preparing"}
-            >
-              <option value={1}>1×</option>
-              <option value={10}>10×</option>
-              <option value={50}>50×</option>
-            </select>
-          </label>
-          <label className="simulation-checkbox-control">
-            <input
-              type="checkbox"
-              checked={junkStatusUnknown}
-              onChange={(event) => setJunkStatusUnknown(event.target.checked)}
-              disabled={["preparing", "playing", "paused"].includes(playbackState)}
-            />
-            <span>Junk status unknown</span>
-          </label>
-          <label className="simulation-checkbox-control route-visibility-control">
-            <input
-              type="checkbox"
-              role="switch"
-              checked={showRoute}
-              onChange={(event) => setShowRoute(event.target.checked)}
-              aria-label="Show route"
-            />
-            <span>Show route</span>
-          </label>
-          {playbackState === "playing" ? (
-            <button
-              className="simulation-button secondary"
-              type="button"
-              onClick={() => setPlaybackState("paused")}
-            >
-              Pause
-            </button>
-          ) : playbackState === "paused" ? (
-            <button
-              className="simulation-button"
-              type="button"
-              onClick={() => setPlaybackState("playing")}
-              disabled={isCheckingNearby}
-            >
-              {isCheckingNearby ? "Checking nearby…" : "Resume"}
-            </button>
-          ) : (
-            <button
-              className="simulation-button"
-              type="submit"
-              disabled={
-                !isLoaded ||
-                !geocodingLibrary ||
-                !routesLibrary ||
-                playbackState === "preparing" ||
-                !startAddress.trim() ||
-                !isDeliveryCountValid ||
-                !isCycleCountValid
-              }
-            >
-              {playbackState === "preparing"
-                ? "Preparing…"
-                : playbackState === "completed" && simulatedDeliveryAddressKeys.length > 0
-                  ? "Continue with remaining"
-                  : "Start simulation"}
-            </button>
-          )}
-          {plan ? (
-            <button className="simulation-button secondary" type="button" onClick={resetSimulation}>
-              Reset demo state
-            </button>
-          ) : null}
+          <div className="simulation-control-row simulation-primary-controls">
+            <label className="simulation-start-control">
+              <span>Start address</span>
+              <input
+                value={startAddress}
+                onChange={(event) => setStartAddress(event.target.value)}
+                placeholder="e.g. 10 Tawa Drive, Albany, Auckland"
+                autoComplete="street-address"
+                required
+                disabled={playbackState === "preparing"}
+              />
+            </label>
+            <label className="simulation-start-street-control">
+              <span>Start street</span>
+              <select
+                value={selectedStartStreet ?? ""}
+                onChange={(event) => setStartStreet(event.target.value)}
+                disabled={
+                  ["preparing", "playing", "paused"].includes(playbackState) ||
+                  availableStartStreets.length === 0
+                }
+                aria-label="Start street"
+              >
+                <option value="">Automatic (nearest)</option>
+                {availableStartStreets.map((street) => (
+                  <option key={street} value={street}>
+                    {street}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="simulation-control-row simulation-secondary-controls">
+            <label className="simulation-speed-control">
+              <span>Runs (max {MAX_SIMULATION_CYCLES})</span>
+              <input
+                type="number"
+                min={1}
+                max={MAX_SIMULATION_CYCLES}
+                value={cycleCount}
+                onChange={(event) => setCycleCount(event.target.value)}
+                disabled={["preparing", "playing", "paused"].includes(playbackState)}
+                required
+              />
+            </label>
+            <label className="simulation-speed-control">
+              <span>Target per run (max {maxDeliveries})</span>
+              <input
+                type="number"
+                min={1}
+                max={maxDeliveries}
+                value={normalizedDeliveryCount}
+                onChange={(event) => setDeliveryCount(event.target.value)}
+                disabled={["preparing", "playing", "paused"].includes(playbackState) || maxDeliveries === 0}
+                required
+              />
+            </label>
+            <label className="simulation-speed-control">
+              <span>Speed</span>
+              <select
+                value={speed}
+                onChange={(event) => setSpeed(Number(event.target.value))}
+                disabled={playbackState === "preparing"}
+              >
+                <option value={1}>1×</option>
+                <option value={10}>10×</option>
+                <option value={50}>50×</option>
+              </select>
+            </label>
+            <label className="simulation-checkbox-control">
+              <input
+                type="checkbox"
+                checked={junkStatusUnknown}
+                onChange={(event) => setJunkStatusUnknown(event.target.checked)}
+                disabled={["preparing", "playing", "paused"].includes(playbackState)}
+              />
+              <span>Junk status unknown</span>
+            </label>
+            <label className="simulation-checkbox-control route-visibility-control">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={showRoute}
+                onChange={(event) => setShowRoute(event.target.checked)}
+                aria-label="Show route"
+              />
+              <span>Show route</span>
+            </label>
+            <label className="simulation-algorithm-control">
+              <span>Planning algorithm</span>
+              <select
+                value={algorithmId}
+                onChange={(event) => {
+                  const nextAlgorithmId = getSelectableSimulationAlgorithmId(
+                    event.target.value,
+                  );
+                  if (nextAlgorithmId) setAlgorithmId(nextAlgorithmId);
+                }}
+                disabled={["preparing", "playing", "paused"].includes(playbackState)}
+                title={selectedAlgorithm.description}
+              >
+                {SIMULATION_ALGORITHM_OPTIONS.map((option) => (
+                  <option
+                    key={option.id}
+                    value={option.id}
+                    disabled={option.status !== "available"}
+                  >
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {playbackState === "playing" ? (
+              <button
+                className="simulation-button secondary"
+                type="button"
+                onClick={() => setPlaybackState("paused")}
+              >
+                Pause
+              </button>
+            ) : playbackState === "paused" ? (
+              <button
+                className="simulation-button"
+                type="button"
+                onClick={() => setPlaybackState("playing")}
+                disabled={isCheckingNearby}
+              >
+                {isCheckingNearby ? "Checking nearby…" : "Resume"}
+              </button>
+            ) : (
+              <button
+                className="simulation-button"
+                type="submit"
+                disabled={
+                  !isLoaded ||
+                  !geocodingLibrary ||
+                  !routesLibrary ||
+                  playbackState === "preparing" ||
+                  !startAddress.trim() ||
+                  !isDeliveryCountValid ||
+                  !isCycleCountValid
+                }
+              >
+                {playbackState === "preparing"
+                  ? "Preparing…"
+                  : playbackState === "completed" && simulatedDeliveryAddressKeys.length > 0
+                    ? "Continue with remaining"
+                    : "Start simulation"}
+              </button>
+            )}
+            {plan ? (
+              <button className="simulation-button secondary" type="button" onClick={resetSimulation}>
+                Reset demo state
+              </button>
+            ) : null}
+          </div>
         </form>
         <div className="simulation-live-strip" aria-live="polite">
           {plan ? (
